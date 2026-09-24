@@ -1,0 +1,160 @@
+[CHECK 1] save_script(p1hello) -> name/size>0/updated_at ... OK
+[CHECK 2] list_scripts contains 'p1hello' ... OK
+[CHECK 3] run_script(p1hello) -> status='succeeded', exit_code==0 ... OK
+[CHECK 4] run stdout: 3 lines in order; duration_ms int>=0 ... OK
+[CHECK 5] run_script(p1fail) -> status='failed', exit_code==3 ... OK
+[CHECK 6] p1fail streams: stderr boom, stdout pre-fail, duration_ms present ... OK
+[CHECK 7] job_status(p1fail job) -> status='failed', exit_code==3 ... OK
+[CHECK 8] get_log(tail=2) == 'p1-edge-4\np1-edge-5' exact ... OK
+[CHECK 9] get_log(tail=5) contains all 5 lines ... OK
+[09/24/26 14:58:34] Error calling tool 'job_status'                             
+                    ╭─────────── Traceback (most recent call last) ────────────╮
+                    │ /Users/nguyenminhkha/All/Code/opensource-projects/workfo │
+                    │ rge/.venv/lib/python3.13/site-packages/fastmcp/server/se │
+                    │ rver.py:1517 in call_tool                                │
+                    │                                                          │
+                    │ /Users/nguyenminhkha/All/Code/opensource-projects/workfo │
+                    │ rge/.venv/lib/python3.13/site-packages/fastmcp/tools/bas │
+                    │ e.py:440 in _run                                         │
+                    │                                                          │
+                    │                 ... 10 frames hidden ...                 │
+                    │                                                          │
+                    │ /Users/nguyenminhkha/All/Code/opensource-projects/workfo │
+                    │ rge/src/workforge/engine.py:81 in get_status             │
+                    │                                                          │
+                    │    78                                                    │
+                    │    79 def get_status(job_id: str) -> dict[str, Any]:     │
+                    │    80 │   """Job record without the (potentially large)  │
+                    │ ❱  81 │   meta = storage.read_job_meta(job_id)           │
+                    │    82 │   return {k: v for k, v in meta.items() if k not │
+                    │    83                                                    │
+                    │    84                                                    │
+                    │                                                          │
+                    │ /Users/nguyenminhkha/All/Code/opensource-projects/workfo │
+                    │ rge/src/workforge/storage.py:140 in read_job_meta        │
+                    │                                                          │
+                    │   137 │   validate_job_id(job_id)                        │
+                    │   138 │   path = job_meta_path(job_id)                   │
+                    │   139 │   if not path.exists():                          │
+                    │ ❱ 140 │   │   raise ValueError(f"unknown job {job_id!r}" │
+                    │   141 │   return json.loads(path.read_text(encoding="utf │
+                    │   142                                                    │
+                    │   143                                                    │
+                    ╰──────────────────────────────────────────────────────────╯
+                    ValueError: unknown job 'deadbeefdeadbeefdeadbeefdeadbeef'  
+    [captured job_status(job_id='deadbeefdeadbeefdeadbeefdeadbeef')] ToolError: Error calling tool 'job_status': unknown job 'deadbeefdeadbeefdeadbeefdeadbeef'
+[CHECK 10] job_status(bogus 32-hex) raises ToolError ... OK
+                    Error calling tool 'get_log'                                
+                    ╭─────────── Traceback (most recent call last) ────────────╮
+                    │ /Users/nguyenminhkha/All/Code/opensource-projects/workfo │
+                    │ rge/.venv/lib/python3.13/site-packages/fastmcp/server/se │
+                    │ rver.py:1517 in call_tool                                │
+                    │                                                          │
+                    │ /Users/nguyenminhkha/All/Code/opensource-projects/workfo │
+                    │ rge/.venv/lib/python3.13/site-packages/fastmcp/tools/bas │
+                    │ e.py:440 in _run                                         │
+                    │                                                          │
+                    │                 ... 9 frames hidden ...                  │
+                    │                                                          │
+                    │ /Users/nguyenminhkha/All/Code/opensource-projects/workfo │
+                    │ rge/src/workforge/server.py:105 in get_log               │
+                    │                                                          │
+                    │   102 │   Output streams to disk as the script executes, │
+                    │   103 │   long run shows progress. Returns "" before the │
+                    │   104 │   """                                            │
+                    │ ❱ 105 │   return storage.read_job_log(job_id, tail)      │
+                    │   106                                                    │
+                    │   107                                                    │
+                    │   108 @mcp.tool()                                        │
+                    │                                                          │
+                    │ /Users/nguyenminhkha/All/Code/opensource-projects/workfo │
+                    │ rge/src/workforge/storage.py:160 in read_job_log         │
+                    │                                                          │
+                    │   157 │   """                                            │
+                    │   158 │   validate_job_id(job_id)                        │
+                    │   159 │   if not job_meta_path(job_id).exists():         │
+                    │ ❱ 160 │   │   raise ValueError(f"unknown job {job_id!r}" │
+                    │   161 │   log = job_log_path(job_id)                     │
+                    │   162 │   if not log.exists():                           │
+                    │   163 │   │   return ""                                  │
+                    ╰──────────────────────────────────────────────────────────╯
+                    ValueError: unknown job 'deadbeefdeadbeefdeadbeefdeadbeef'  
+    [captured get_log(job_id='deadbeefdeadbeefdeadbeefdeadbeef')] ToolError: Error calling tool 'get_log': unknown job 'deadbeefdeadbeefdeadbeefdeadbeef'
+[CHECK 11] get_log(bogus 32-hex) raises ToolError ... OK
+                    Error calling tool 'get_output'                             
+                    ╭─────────── Traceback (most recent call last) ────────────╮
+                    │ /Users/nguyenminhkha/All/Code/opensource-projects/workfo │
+                    │ rge/.venv/lib/python3.13/site-packages/fastmcp/server/se │
+                    │ rver.py:1517 in call_tool                                │
+                    │                                                          │
+                    │ /Users/nguyenminhkha/All/Code/opensource-projects/workfo │
+                    │ rge/.venv/lib/python3.13/site-packages/fastmcp/tools/bas │
+                    │ e.py:440 in _run                                         │
+                    │                                                          │
+                    │                 ... 10 frames hidden ...                 │
+                    │                                                          │
+                    │ /Users/nguyenminhkha/All/Code/opensource-projects/workfo │
+                    │ rge/src/workforge/engine.py:87 in get_output             │
+                    │                                                          │
+                    │    84                                                    │
+                    │    85 def get_output(job_id: str) -> dict[str, Any]:     │
+                    │    86 │   """Full structured result for a job."""        │
+                    │ ❱  87 │   return storage.read_job_meta(job_id)           │
+                    │    88                                                    │
+                    │    89                                                    │
+                    │    90 # ------------------------------------------------ │
+                    │                                                          │
+                    │ /Users/nguyenminhkha/All/Code/opensource-projects/workfo │
+                    │ rge/src/workforge/storage.py:140 in read_job_meta        │
+                    │                                                          │
+                    │   137 │   validate_job_id(job_id)                        │
+                    │   138 │   path = job_meta_path(job_id)                   │
+                    │   139 │   if not path.exists():                          │
+                    │ ❱ 140 │   │   raise ValueError(f"unknown job {job_id!r}" │
+                    │   141 │   return json.loads(path.read_text(encoding="utf │
+                    │   142                                                    │
+                    │   143                                                    │
+                    ╰──────────────────────────────────────────────────────────╯
+                    ValueError: unknown job 'deadbeefdeadbeefdeadbeefdeadbeef'  
+    [captured get_output(job_id='deadbeefdeadbeefdeadbeefdeadbeef')] ToolError: Error calling tool 'get_output': unknown job 'deadbeefdeadbeefdeadbeefdeadbeef'
+[CHECK 12] get_output(bogus 32-hex) raises ToolError ... OK
+                    Error calling tool 'job_status'                             
+                    ╭─────────── Traceback (most recent call last) ────────────╮
+                    │ /Users/nguyenminhkha/All/Code/opensource-projects/workfo │
+                    │ rge/.venv/lib/python3.13/site-packages/fastmcp/server/se │
+                    │ rver.py:1517 in call_tool                                │
+                    │                                                          │
+                    │ /Users/nguyenminhkha/All/Code/opensource-projects/workfo │
+                    │ rge/.venv/lib/python3.13/site-packages/fastmcp/tools/bas │
+                    │ e.py:440 in _run                                         │
+                    │                                                          │
+                    │                 ... 11 frames hidden ...                 │
+                    │                                                          │
+                    │ /Users/nguyenminhkha/All/Code/opensource-projects/workfo │
+                    │ rge/src/workforge/storage.py:137 in read_job_meta        │
+                    │                                                          │
+                    │   134                                                    │
+                    │   135                                                    │
+                    │   136 def read_job_meta(job_id: str) -> dict[str, Any]:  │
+                    │ ❱ 137 │   validate_job_id(job_id)                        │
+                    │   138 │   path = job_meta_path(job_id)                   │
+                    │   139 │   if not path.exists():                          │
+                    │   140 │   │   raise ValueError(f"unknown job {job_id!r}" │
+                    │                                                          │
+                    │ /Users/nguyenminhkha/All/Code/opensource-projects/workfo │
+                    │ rge/src/workforge/storage.py:83 in validate_job_id       │
+                    │                                                          │
+                    │    80 def validate_job_id(job_id: str) -> str:           │
+                    │    81 │   """Validate and return a job id, or raise Valu │
+                    │    82 │   if not isinstance(job_id, str) or not JOB_ID_R │
+                    │ ❱  83 │   │   raise ValueError(f"invalid job_id {job_id! │
+                    │    84 │   return job_id                                  │
+                    │    85                                                    │
+                    │    86                                                    │
+                    ╰──────────────────────────────────────────────────────────╯
+                    ValueError: invalid job_id 'not-a-job-id': expected 32-char 
+                    hex string                                                  
+    [captured job_status(job_id='not-a-job-id')] ToolError: Error calling tool 'job_status': invalid job_id 'not-a-job-id': expected 32-char hex string
+[CHECK 13] job_status('not-a-job-id') raises ToolError ... OK
+[CHECK 14] client alive after errors: list_scripts() succeeds ... OK
+RESULT: PASS
