@@ -15,6 +15,7 @@ marked ``failed`` with a timeout note. A job never hangs the server.
 
 from __future__ import annotations
 
+import atexit
 import os
 import signal
 import subprocess
@@ -36,6 +37,13 @@ _pool: ThreadPoolExecutor | None = None
 _pool_lock = threading.Lock()
 _pool_failed = False
 
+# Tracks running subprocesses by job_id so the shutdown hook can SIGKILL
+# in-flight children without waiting for the worker thread to return.
+# Non-daemon pool workers block interpreter shutdown until each in-flight
+# job completes — these hooks break that wait.
+_in_flight: dict[str, subprocess.Popen] = {}
+_in_flight_lock = threading.Lock()
+
 
 def _get_pool() -> ThreadPoolExecutor:
     """Return the shared job pool, recreating it if a prior pool broke."""
@@ -49,7 +57,78 @@ def _get_pool() -> ThreadPoolExecutor:
         return _pool
 
 
+def _shutdown_pool() -> None:
+    """Cancel pending futures and SIGKILL in-flight subprocess children.
+
+    Idempotent. Registered for atexit + SIGINT/SIGTERM so a non-daemon pool
+    cannot wedge the process until every worker thread finishes.
+    """
+    global _pool
+    with _pool_lock:
+        pool = _pool
+        _pool = None
+    # Kill children first — otherwise the worker thread can sit in
+    # proc.wait() long after the pool has shut down.
+    with _in_flight_lock:
+        inflight = list(_in_flight.values())
+    for proc in inflight:
+        try:
+            proc.kill()
+        except (OSError, ProcessLookupError):
+            pass
+    if pool is not None:
+        # cancel_futures drops queued work; wait=False lets our own cleanup
+        # return promptly. The reader threads are daemon, so they vanish.
+        pool.shutdown(wait=False, cancel_futures=True)
+
+
+atexit.register(_shutdown_pool)
+
+
+def _install_signal_handlers() -> None:
+    """Replace SIGINT/SIGTERM so a hung pool cannot block shutdown."""
+    def _handler(signum, _frame):
+        _shutdown_pool()
+        # Restore default handler and re-raise so the standard exit flow
+        # still runs (KeyboardInterrupt, clean termination).
+        try:
+            signal.signal(signum, signal.SIG_DFL)
+        except (ValueError, OSError):
+            pass
+        try:
+            os.kill(os.getpid(), signum)
+        except OSError:
+            pass
+
+    if _IS_WINDOWS:
+        # Best-effort on Windows: atexit above still runs.
+        return
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            signal.signal(sig, _handler)
+        except (ValueError, OSError):
+            # Not in main thread, or unsupported platform — atexit still
+            # provides a safety net.
+            pass
+
+
+_IS_WINDOWS = os.name == "nt"
+_install_signal_handlers()
+
+
 # ----------------------------------------------------------------- public API
+
+
+# Keys exposed via get_output (full result incl. captured stdout/stderr).
+# Notably excludes script_path: an absolute filesystem path leaks server
+# internals to the agent and is not actionable from the client side.
+OUTPUT_KEYS: tuple[str, ...] = (
+    "job_id", "script", "args", "status", "exit_code",
+    "submitted_at", "started_at", "finished_at", "duration_ms",
+    "stdout", "stderr", "error",
+)
+# job_status drops the bulky captured output but keeps everything else.
+STATUS_KEYS: tuple[str, ...] = tuple(k for k in OUTPUT_KEYS if k not in ("stdout", "stderr"))
 
 
 def run_sync(name: str, args: list[Any], timeout_seconds: int) -> dict[str, Any]:
@@ -67,11 +146,17 @@ def submit(name: str, args: list[Any], timeout_seconds: int) -> dict[str, Any]:
     storage.write_job_meta(meta)
     try:
         _get_pool().submit(_execute, meta)
-    except RuntimeError:
-        # Pool is broken (e.g. after interpreter shutdown); flag it so the next
-        # submission builds a fresh pool instead of reusing a dead executor.
+    except RuntimeError as exc:
+        # Pool is broken (e.g. after interpreter shutdown); flag it so the
+        # next submission builds a fresh pool instead of reusing a dead
+        # executor. The record was already persisted as "queued" — finalize
+        # it as "failed" so it isn't stranded on disk forever.
         with _pool_lock:
             _pool_failed = True
+        meta["status"] = "failed"
+        meta["finished_at"] = storage.now_iso()
+        meta["error"] = f"submission failed: {exc!r}"
+        _safe_write_job_meta(meta)
         raise
     return {"job_id": meta["job_id"], "status": meta["status"]}
 
@@ -79,12 +164,13 @@ def submit(name: str, args: list[Any], timeout_seconds: int) -> dict[str, Any]:
 def get_status(job_id: str) -> dict[str, Any]:
     """Job record without the (potentially large) captured output."""
     meta = storage.read_job_meta(job_id)
-    return {k: v for k, v in meta.items() if k not in ("stdout", "stderr")}
+    return {k: meta[k] for k in STATUS_KEYS if k in meta}
 
 
 def get_output(job_id: str) -> dict[str, Any]:
     """Full structured result for a job."""
-    return storage.read_job_meta(job_id)
+    meta = storage.read_job_meta(job_id)
+    return {k: meta[k] for k in OUTPUT_KEYS if k in meta}
 
 
 # ------------------------------------------------------------------ execution
@@ -121,16 +207,20 @@ def _execute(meta: dict[str, Any]) -> None:
     the job as ``failed`` so it never sits on disk stuck in ``running``.
     """
     job_d = storage.job_dir(meta["job_id"])
+    # Captures + start time live OUTSIDE the try so the except handler can
+    # hoist them even if proc.wait() / reader joins raise mid-flight. Without
+    # this, a failure between wait() and the buffer joins would persist an
+    # empty stdout/stderr and erase any progress the script already made.
+    started = time.monotonic()
+    stdout_buf: list[str] = []
+    stderr_buf: list[str] = []
+    proc: subprocess.Popen | None = None
     try:
         meta["status"] = "running"
         meta["started_at"] = storage.now_iso()
         storage.write_job_meta(meta)
 
         cmd = [sys.executable, meta["script_path"], *meta["args"]]
-        started = time.monotonic()
-        stdout_buf: list[str] = []
-        stderr_buf: list[str] = []
-
         proc = subprocess.Popen(
             cmd,
             cwd=job_d,
@@ -139,6 +229,10 @@ def _execute(meta: dict[str, Any]) -> None:
             stderr=subprocess.PIPE,
             start_new_session=not _IS_WINDOWS,  # own process group -> group kill
         )
+        # Register so a shutdown hook can SIGKILL us without waiting for
+        # proc.wait() to return naturally.
+        with _in_flight_lock:
+            _in_flight[meta["job_id"]] = proc
 
         # One reader thread per pipe; both append into the shared job.log,
         # serialized by _LOG_LOCK.
@@ -160,10 +254,11 @@ def _execute(meta: dict[str, Any]) -> None:
         for t in readers:
             t.start()
 
-        timeout = meta["timeout_seconds"] or None
+        # timeout_seconds is enforced as >= 1 by _validate_timeout, so a
+        # plain integer wait is sufficient (no "or None" magic).
         timed_out = False
         try:
-            proc.wait(timeout=timeout)
+            proc.wait(timeout=meta["timeout_seconds"])
         except subprocess.TimeoutExpired:
             timed_out = True
             _kill_tree(proc)
@@ -193,14 +288,25 @@ def _execute(meta: dict[str, Any]) -> None:
             else:
                 meta["status"] = "failed"
                 meta["error"] = f"exited with code {proc.returncode}"
-        storage.write_job_meta(meta)
+        _safe_write_job_meta(meta)
     except Exception as exc:
         # Spawn/pump failure (e.g. OSError from Popen): finalize the record so
         # an async job never ends up "running" forever with no process.
+        # Hoist captures FIRST so anything the script already wrote survives.
+        meta["stdout"] = "".join(stdout_buf)
+        meta["stderr"] = "".join(stderr_buf)
         meta["status"] = "failed"
         meta["error"] = repr(exc)
         meta["finished_at"] = storage.now_iso()
-        storage.write_job_meta(meta)
+        if proc is not None:
+            try:
+                _kill_tree(proc)
+            except Exception:
+                pass
+        _safe_write_job_meta(meta)
+    finally:
+        with _in_flight_lock:
+            _in_flight.pop(meta["job_id"], None)
 
 
 # Serializes job.log appends from the two per-pipe reader threads; without it,
@@ -248,6 +354,28 @@ def _terminate(proc: subprocess.Popen) -> None:
         pass
 
 
+def _safe_write_job_meta(meta: dict[str, Any]) -> None:
+    """Persist job meta; on failure, retry once then give up silently.
+
+    A failing final write must not wedge the job as "running" forever; we
+    do our best to persist and log any second failure to stderr. The
+    double-write covers the common "transient fs hiccup" case (tmp file
+    conflict after a fast crash recovery, ENOSPC flush, etc.).
+    """
+    try:
+        storage.write_job_meta(meta)
+        return
+    except Exception:
+        pass
+    try:
+        storage.write_job_meta(meta)
+    except Exception as exc:
+        sys.stderr.write(
+            f"[workforge] failed to persist final meta for {meta.get('job_id')}: {exc!r}\n"
+        )
+        sys.stderr.flush()
+
+
 def _run_result(meta: dict[str, Any]) -> dict[str, Any]:
     return {
         "job_id": meta["job_id"],
@@ -264,10 +392,12 @@ def _validate_timeout(timeout_seconds: int) -> int:
     try:
         timeout = int(timeout_seconds)
     except (TypeError, ValueError):
-        raise ValueError("timeout_seconds must be a non-negative integer") from None
-    if timeout < 0:
-        raise ValueError("timeout_seconds must be >= 0 (0 = no timeout)")
+        raise ValueError("timeout_seconds must be a positive integer") from None
+    if timeout < 1:
+        # R2: a zero/negative timeout would mean "no timeout", which silently
+        # wedges async jobs in the pool. Reject explicitly instead.
+        raise ValueError(
+            f"timeout_seconds must be >= 1 (got {timeout}); "
+            "0/negative means no timeout, which is rejected for safety"
+        )
     return timeout
-
-
-_IS_WINDOWS = os.name == "nt"

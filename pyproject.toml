@@ -22,7 +22,7 @@ classifiers = [
     "Topic :: Software Development :: Libraries :: Python Modules",
 ]
 dependencies = [
-    "fastmcp>=2.0.0",
+    "fastmcp>=4.0.8",
 ]
 
 [project.scripts]

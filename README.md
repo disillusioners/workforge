@@ -2,7 +2,7 @@
 
 **An MCP server + worker system for AI agents: save Python scripts, run them (sync or async), stream logs live, fetch structured outputs.**
 
-WorkForge turns "can you run this snippet for me?" into a first-class MCP toolset. An AI agent (Claude Desktop, Cursor, or any MCP client) can persist a Python script under a stable name, execute it synchronously and get the result back, or launch it in the background and poll status / tail the live log while it runs. Jobs are durable — every run gets an ID and its output is written to disk, so logs and results survive restarts.
+WorkForge turns "can you run this snippet for me?" into a first-class MCP toolset. An AI agent (Claude Desktop, Cursor, or any MCP client) can persist a Python script under a stable name, execute it synchronously and get the result back, or launch it in the background and poll status / tail the live log while it runs. Jobs are durable — every run gets an ID and its output is written to disk, so **completed** logs and results survive restarts. (In-flight async jobs do NOT survive: a process restart kills any job that was still running and leaves no record of the partial run — by design, demo-phase only.)
 
 - **MCP-native** — built on [FastMCP](https://github.com/jlowin/fastmcp), speaks stdio MCP: works with Claude Desktop, Cursor, and any MCP client.
 - **Sync *and* async execution** — block until done, or fire-and-forget with live log streaming.
@@ -77,11 +77,11 @@ Replace `/absolute/path/to/workforge` with the real cloned path. To give the ser
 |---|---|---|---|
 | `save_script` | `(name, content, description="")` | `{name, size, updated_at}` | Persists `scripts/<name>.py`. `name` must be a slug (`[a-z][a-z0-9_-]*`). Overwrites allowed. |
 | `list_scripts` | `()` | `[{name, description, size, updated_at}]` | All saved scripts. |
-| `run_script` | `(name, args=[], timeout_seconds=120)` | `{job_id, status, exit_code, stdout, stderr, duration_ms, error}` | **Blocks** until the run finishes (or times out → killed, `status: "failed"`). |
-| `run_script_async` | `(name, args=[], timeout_seconds=0)` | `{job_id, status}` | Returns immediately (`status` starts at `queued`/`running`). `timeout_seconds=0` = no timeout. |
-| `job_status` | `(job_id)` | `{status, exit_code, duration_ms, submitted_at, started_at, finished_at, error}` | `status` ∈ `queued \| running \| succeeded \| failed`. |
-| `get_log` | `(job_id, tail=null)` | combined stdout+stderr (text) | **Works mid-run** — output streams to disk as the script executes. `tail=N` = last N lines. |
-| `get_output` | `(job_id)` | `{exit_code, stdout, stderr, duration_ms, started_at, finished_at}` | Final structured result. |
+| `run_script` | `(name, args=[], timeout_seconds=120)` | `{job_id, status, exit_code, stdout, stderr, duration_ms, error}` | **Blocks** until the run finishes (or times out → killed, `status: "failed"`). `timeout_seconds` must be ≥ 1; values < 1 are rejected. |
+| `run_script_async` | `(name, args=[], timeout_seconds=300)` | `{job_id, status}` | Returns immediately (`status` starts at `queued`/`running`). Default 300s = 5 min cap (0 / no-timeout is rejected — a hung job would silently saturate the 4-worker pool). |
+| `job_status` | `(job_id)` | `{job_id, script, args, status, exit_code, submitted_at, started_at, finished_at, duration_ms, error}` | `status` ∈ `queued \| running \| succeeded \| failed`. Captured stdout/stderr omitted (use `get_output`); absolute `script_path` intentionally excluded. |
+| `get_log` | `(job_id, tail=null)` | combined stdout+stderr (text) | **Works mid-run** — output streams to disk as the script executes. `tail=N` = last N lines; `tail=0` returns the empty string (not the full log). |
+| `get_output` | `(job_id)` | `{job_id, script, args, status, exit_code, submitted_at, started_at, finished_at, duration_ms, stdout, stderr, error}` | Final structured result; absolute `script_path` intentionally excluded. |
 
 Script names are slugs (lowercase letters, digits, `-`, `_`) — no paths, no dots. Scripts run with `sys.executable <script> <args...>` and `cwd` set to the job directory, so a script can write scratch files next to its own `job.log` without cluttering anything else.
 

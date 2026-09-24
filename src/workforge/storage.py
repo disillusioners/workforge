@@ -16,17 +16,21 @@ from __future__ import annotations
 import json
 import os
 import re
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 # Script names are slugs: lowercase letter first, then letters/digits/-/_.
 # This doubles as path-traversal protection (no dots, no separators).
-NAME_RE = re.compile(r"^[a-z][a-z0-9_-]{0,63}$")
+# fullmatch (not match + $) so trailing newlines/whitespace cannot sneak
+# through (`"abc\n"` would otherwise pass and create `scripts/abc\n.py`).
+NAME_RE = re.compile(r"[a-z][a-z0-9_-]{0,63}")
 
 # Job ids are uuid4 hex: exactly 32 lowercase hex chars. Validated before any
-# path use so a crafted id cannot escape jobs/ (defense in depth).
-JOB_ID_RE = re.compile(r"^[0-9a-f]{32}$")
+# path use so a crafted id cannot escape jobs/ (defense in depth). Same
+# fullmatch discipline as NAME_RE.
+JOB_ID_RE = re.compile(r"[0-9a-f]{32}")
 
 
 def home() -> Path:
@@ -69,7 +73,7 @@ def now_iso() -> str:
 
 def validate_name(name: str) -> str:
     """Validate and return a script name, or raise ValueError."""
-    if not isinstance(name, str) or not NAME_RE.match(name):
+    if not isinstance(name, str) or not NAME_RE.fullmatch(name):
         raise ValueError(
             f"invalid script name {name!r}: must match [a-z][a-z0-9_-]* "
             "(lowercase slug, max 64 chars)"
@@ -79,7 +83,7 @@ def validate_name(name: str) -> str:
 
 def validate_job_id(job_id: str) -> str:
     """Validate and return a job id, or raise ValueError."""
-    if not isinstance(job_id, str) or not JOB_ID_RE.match(job_id):
+    if not isinstance(job_id, str) or not JOB_ID_RE.fullmatch(job_id):
         raise ValueError(f"invalid job_id {job_id!r}: expected 32-char hex string")
     return job_id
 
@@ -88,8 +92,24 @@ def save_script(name: str, content: str, description: str = "") -> dict[str, Any
     """Persist a script (and its metadata sidecar); overwrite allowed."""
     validate_name(name)
     data = content.encode("utf-8")
-    scripts_dir().mkdir(parents=True, exist_ok=True)
-    script_path(name).write_bytes(data)
+    sdir = scripts_dir()
+    sdir.mkdir(parents=True, exist_ok=True)
+    spath = script_path(name)
+    # Atomic write: tmp + os.replace. A crash mid-write leaves the previous
+    # good copy (or no file) — never a truncated script that later executes.
+    # Unique tmp name per call so concurrent save_script(name) calls do not
+    # race over a fixed tmp path.
+    tmp = sdir / f".{name}.{uuid.uuid4().hex}.tmp"
+    try:
+        tmp.write_bytes(data)
+        os.replace(tmp, spath)
+    except Exception:
+        # Clean up partial tmp so the scripts/ dir doesn't accumulate junk.
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        raise
     meta = {
         "name": name,
         "description": description or "",
@@ -112,6 +132,12 @@ def list_scripts() -> list[dict[str, Any]]:
         except (json.JSONDecodeError, OSError):
             continue
         name = meta.get("name") or path.stem
+        # Re-validate after read: a tampered sidecar ({"name": "../escape"})
+        # could otherwise escape scripts/. Drop invalid entries silently.
+        try:
+            validate_name(name)
+        except ValueError:
+            continue
         # Trust the file on disk for size (source of truth).
         spath = script_path(name)
         if not spath.exists():
@@ -145,7 +171,8 @@ def write_job_meta(meta: dict[str, Any]) -> None:
     """Atomically persist a job record (tmp file + rename)."""
     path = job_meta_path(meta["job_id"])
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(".json.tmp")
+    # Unique tmp name per call so concurrent writes cannot interleave bytes.
+    tmp = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
     tmp.write_text(json.dumps(meta, indent=2), encoding="utf-8")
     os.replace(tmp, path)
 
@@ -165,6 +192,11 @@ def read_job_log(job_id: str, tail: int | None = None) -> str:
     if tail is not None:
         if tail < 0:
             raise ValueError("tail must be >= 0")
+        # tail=0 must yield empty string: `text.splitlines()[-0:]` is the
+        # WHOLE list (because `-0 == 0`); short-circuit here so the contract
+        # is "last N lines, 0 = none" instead of "0 = everything".
+        if tail == 0:
+            return ""
         text = "\n".join(text.splitlines()[-tail:])
     return text
 
@@ -174,6 +206,8 @@ def read_job_log(job_id: str, tail: int | None = None) -> str:
 
 def _write_json(path: Path, data: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
+    # Unique tmp name per call (same formula as the script-body write above
+    # and write_job_meta) so concurrent calls don't race over a fixed tmp path.
+    tmp = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
     tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
     os.replace(tmp, path)

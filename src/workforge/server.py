@@ -57,6 +57,7 @@ def run_script(
         name: Name of a saved script (see list_scripts / save_script).
         args: Command-line arguments passed to the script (sys.argv[1:]).
         timeout_seconds: Kill the script (and its children) if it runs longer.
+            Must be >= 1 (no implicit "0 = no timeout"; rejected as ToolError).
 
     Returns {job_id, status, exit_code, stdout, stderr, duration_ms, error}.
     On timeout the job is killed and status is "failed" with a timeout note.
@@ -66,14 +67,16 @@ def run_script(
 
 @mcp.tool()
 def run_script_async(
-    name: str, args: list[str] | None = None, timeout_seconds: int = 0
+    name: str, args: list[str] | None = None, timeout_seconds: int = 300
 ) -> dict[str, Any]:
     """Run a saved script in the background; returns immediately.
 
     Args:
         name: Name of a saved script.
         args: Command-line arguments passed to the script.
-        timeout_seconds: 0 (default) = no timeout; otherwise kill on expiry.
+        timeout_seconds: Kill the script (and its children) if it runs longer.
+            Must be >= 1; the default is 300s (5 min) instead of "no timeout"
+            so a hung async job cannot permanently saturate the worker pool.
 
     Returns {job_id, status} — poll job_status(job_id), tail get_log(job_id)
     while it runs (output streams live), and fetch get_output(job_id) at the end.
@@ -85,8 +88,11 @@ def run_script_async(
 def job_status(job_id: str) -> dict[str, Any]:
     """Get a job's status: queued | running | succeeded | failed.
 
-    Returns the job record (script, args, timestamps, exit_code, duration_ms,
-    error) without the bulky captured output — use get_output for that.
+    Returns a filtered view of the job record:
+    {job_id, script, args, status, exit_code, submitted_at, started_at,
+    finished_at, duration_ms, error} — the bulky captured stdout/stderr
+    are omitted (use get_output for those). ``script_path`` is intentionally
+    excluded; agents don't need an absolute filesystem path.
     """
     return engine.get_status(job_id)
 
@@ -109,8 +115,11 @@ def get_log(job_id: str, tail: int | None = None) -> str:
 def get_output(job_id: str) -> dict[str, Any]:
     """Get a job's final structured result.
 
-    Returns {exit_code, stdout, stderr, duration_ms, started_at, finished_at,
-    status, error}. Best fetched after job_status reports succeeded/failed;
-    for a still-running job the captured fields are empty/null.
+    Returns a filtered view of the job record:
+    {job_id, script, args, status, exit_code, submitted_at, started_at,
+    finished_at, duration_ms, stdout, stderr, error}. ``script_path`` is
+    intentionally excluded (absolute path is server-internal). Best fetched
+    after job_status reports succeeded/failed; for a still-running job the
+    captured fields are empty/null.
     """
     return engine.get_output(job_id)

@@ -259,4 +259,195 @@ def test_stdio_server_startup(wf_home):
             listing = await call(stdio_client, "list_scripts")
             assert [s["name"] for s in listing] == ["stdio-check"]
 
+    asyncio.run(scenario())
+
+
+# ----------------------------------------------------- regression: deep review
+
+
+def test_get_log_tail_zero_returns_empty_via_tool(client):
+    """R1 regression — must assert through the MCP tool layer (item 14).
+
+    Without the storage-layer early-return fix, ``get_log(tail=0)`` would
+    return the entire log instead of an empty string. Pin both layers:
+    pin the tool contract here, pin the storage layer in the unit test
+    below.
+    """
+    async def scenario():
+        await call(client, "save_script", name="hello", content=HELLO_SCRIPT)
+        res = await call(client, "run_script", name="hello")
+        # Confirm there IS log content first, so tail=0 -> "" is meaningful.
+        full = await call(client, "get_log", job_id=res["job_id"])
+        assert "hello from workforge" in full
+        zero = await call(client, "get_log", job_id=res["job_id"], tail=0)
+        assert zero == ""
+
+    with_memory_client(client, scenario)
+
+
+def test_storage_get_log_tail_zero_returns_empty(wf_home):
+    """R1 unit-level pin: storage layer also returns "" for tail=0."""
+    from workforge import storage
+
+    storage.write_job_meta(
+        {
+            "job_id": "a" * 32,
+            "script": "x",
+            "args": [],
+            "status": "succeeded",
+            "exit_code": 0,
+            "submitted_at": storage.now_iso(),
+            "started_at": storage.now_iso(),
+            "finished_at": storage.now_iso(),
+            "duration_ms": 0,
+            "stdout": "",
+            "stderr": "",
+            "error": None,
+        }
+    )
+    storage.job_log_path("a" * 32).write_text("line-1\nline-2\nline-3\n", encoding="utf-8")
+    assert storage.read_job_log("a" * 32) == "line-1\nline-2\nline-3\n"
+    assert storage.read_job_log("a" * 32, tail=0) == ""
+    assert storage.read_job_log("a" * 32, tail=1) == "line-3"
+    assert storage.read_job_log("a" * 32, tail=2) == "line-2\nline-3"
+
+
+def test_timeout_seconds_zero_rejected_on_sync_and_async(client):
+    """R2 regression — timeout_seconds < 1 rejected on BOTH paths as ToolError."""
+    from fastmcp.exceptions import ToolError
+
+    async def scenario():
+        await call(client, "save_script", name="hello", content=HELLO_SCRIPT)
+        for bad in (0, -1, -5):
+            with pytest.raises(ToolError):
+                await call(client, "run_script", name="hello", timeout_seconds=bad)
+            with pytest.raises(ToolError):
+                await call(
+                    client, "run_script_async", name="hello", timeout_seconds=bad
+                )
+
+    with_memory_client(client, scenario)
+
+
+def test_async_default_timeout_is_300_seconds():
+    """R2 regression — async default is now 300s (not 0/no-timeout)."""
+    import asyncio
+    import inspect
+
+    from workforge.server import mcp
+
+    async def _get():
+        return await mcp.get_tool("run_script_async")
+
+    tool = asyncio.run(_get())
+    sig = inspect.signature(tool.fn)
+    assert sig.parameters["timeout_seconds"].default == 300
+
+
+def test_pool_shutdown_kills_inflight_promptly(client):
+    """R3 regression — calling _shutdown_pool with a running job returns fast
+    AND kills the in-flight child process group (the reason non-daemon pool
+    workers can otherwise wedge the process at shutdown)."""
+    import workforge.engine as engine
+
+    async def scenario():
+        await call(client, "save_script", name="hang", content=HANG_SCRIPT)
+        started = await call(client, "run_script_async", name="hang", timeout_seconds=300)
+        # Wait until the job is actually running so _in_flight is populated.
+        await wait_for_status(client, started["job_id"], {"running"})
+        # Grab the registered Popen so we can verify it gets killed.
+        with engine._in_flight_lock:
+            inflight = list(engine._in_flight.values())
+        assert inflight, "_in_flight should be populated for the running job"
+        proc = inflight[0]
+
+        t0 = time.monotonic()
+        engine._shutdown_pool()
+        elapsed = time.monotonic() - t0
+        assert elapsed < 5.0, f"_shutdown_pool took {elapsed:.1f}s, expected <5s"
+        # Process must be dead (or at least unwaitable) within the same window.
+        proc.wait(timeout=2)
+        assert proc.returncode is not None
+
+    with_memory_client(client, scenario)
+
+
+def test_concurrent_same_name_saves_no_corruption(wf_home):
+    """#6 regression — N threads saving the same script concurrently must
+    leave a single, complete, valid .py + .json sidecar (no fixed-tmp race
+    overwriting each other's bytes)."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    from workforge import storage
+
+    N = 16
+    contents = [f"print({i!r})\n" for i in range(N)]
+
+    def worker(idx):
+        return storage.save_script("race", contents[idx], description=f"writer-{idx}")
+
+    with ThreadPoolExecutor(max_workers=N) as pool:
+        results = list(pool.map(worker, range(N)))
+
+    # The script body on disk must equal SOME worker's full write — never
+    # a byte-wise interleaving. Read it directly via the storage layer.
+    spath = storage.script_path("race")
+    assert spath.exists()
+    final_body = spath.read_text(encoding="utf-8")
+    assert final_body in contents, f"final body {final_body!r} is not a full write"
+
+    # list_scripts must report exactly one entry with the saved metadata.
+    listing = storage.list_scripts()
+    assert len(listing) == 1
+    assert listing[0]["name"] == "race"
+    # All N workers must have returned a meta dict with size matching their
+    # write — none should have raised (which would have happened with the
+    # old fixed-tmp + concurrent os.replace).
+    assert len(results) == N
+    assert all(r["size"] == len(c.encode()) for r, c in zip(results, contents))
+
+
+def test_tampered_sidecar_name_is_skipped(wf_home):
+    """#11 regression — list_scripts must drop entries whose sidecar ``name``
+    fails validation (otherwise ``{"name": "../escape"}`` could escape
+    scripts/)."""
+    import json
+
+    from workforge import storage
+
+    storage.scripts_dir().mkdir(parents=True, exist_ok=True)
+    # Plant a tampered sidecar with a path-traversal name.
+    (storage.scripts_dir() / "evil.json").write_text(
+        json.dumps({"name": "../escape", "size": 0, "updated_at": "x"}),
+        encoding="utf-8",
+    )
+    # Also plant a valid one — it must still show up.
+    storage.save_script("good", "print('ok')\n")
+
+    listing = storage.list_scripts()
+    names = [s["name"] for s in listing]
+    assert "good" in names
+    assert "../escape" not in names
+    assert all("/" not in n and "\\" not in n and ".." not in n for n in names)
+
+
+def test_trailing_newline_name_rejected(client):
+    """#12 regression — script names with trailing newline (which the old
+    ``$``-anchored regex allowed) must now be rejected by save_script."""
+    from fastmcp.exceptions import ToolError
+
+    async def scenario():
+        with pytest.raises(ToolError):
+            await call(client, "save_script", name="abc\n", content="pass")
+        # Same for the storage layer's validator.
+        from workforge import storage
+
+        with pytest.raises(ValueError):
+            storage.validate_name("abc\n")
+        with pytest.raises(ValueError):
+            storage.validate_job_id("0123456789abcdef0123456789abcde\n")
+
+    with_memory_client(client, scenario)
+
+
 
