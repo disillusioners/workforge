@@ -4,6 +4,12 @@
 #
 # Build (from repo root):
 #   docker build -t workforge:0.1.0 .
+# Recommended (with full OCI provenance labels):
+#   docker build \
+#     --build-arg VERSION=0.1.0 \
+#     --build-arg VCS_REF=$(git rev-parse --short HEAD) \
+#     --build-arg BUILD_DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ) \
+#     -t workforge:0.1.0 .
 #
 # Run (stdio MCP server — the MCP client attaches via stdin/stdout):
 #   docker run --rm -i \
@@ -65,11 +71,14 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 # ---------- Stage 2: runtime ----------
 FROM python:3.12-slim-bookworm
 
-# Non-root runtime user (least privilege). Home dir = the data volume
-# mount point; pre-created and chowned so named volumes inherit the
-# right ownership on first mount.
+# Non-root runtime user (least privilege). UID is PINNED to 999:
+# a future base refresh that already allocates 999 fails the build
+# loudly instead of silently shifting ownership, and existing volumes
+# (chowned to 999) stay valid across base-image updates.
+# Home dir = the data volume mount point; pre-created and chowned so
+# named volumes inherit the right ownership on first mount.
 RUN groupadd -r workforge \
-    && useradd -r -g workforge -d /data/workforge -s /usr/sbin/nologin workforge \
+    && useradd -r -u 999 -g workforge -d /data/workforge -s /usr/sbin/nologin workforge \
     && mkdir -p /data/workforge \
     && chown -R workforge:workforge /data/workforge
 
@@ -91,13 +100,21 @@ VOLUME /data/workforge
 
 USER workforge
 
-# Version label is overridable at build time (CI passes the tag/SHA).
+# OCI labels. VERSION defaults to the package version (0.1.0) so the
+# version label always matches the shipped workforge package; CI passes
+# the release tag on vX.Y.Z pipelines. VCS_REF/BUILD_DATE identify the
+# exact source and build time (revision ≠ version, by design).
 ARG VERSION=0.1.0
+ARG VCS_REF=""
+ARG BUILD_DATE=""
 LABEL org.opencontainers.image.title="WorkForge" \
       org.opencontainers.image.description="MCP server + worker system for AI agents: save Python scripts, run sync/async jobs, stream logs, fetch outputs" \
       org.opencontainers.image.version="${VERSION}" \
+      org.opencontainers.image.revision="${VCS_REF}" \
+      org.opencontainers.image.created="${BUILD_DATE}" \
       org.opencontainers.image.licenses="MIT" \
       org.opencontainers.image.authors="disillusioners / WorkForge contributors" \
+      org.opencontainers.image.url="https://github.com/disillusioners/workforge" \
       org.opencontainers.image.source="https://github.com/disillusioners/workforge" \
       org.opencontainers.image.base.name="docker.io/library/python:3.12-slim-bookworm"
 

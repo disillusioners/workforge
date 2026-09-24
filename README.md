@@ -184,7 +184,7 @@ docker run --rm \
 
 `.gitlab-ci.yml` (stages: `test → build → push`) runs the pytest suite from source, validates the Dockerfile builds on MRs, and publishes to `$CI_REGISTRY_IMAGE` with `:$CI_COMMIT_SHORT_SHA` + `:latest` tags on the `latest` branch (plus `:X.Y.Z` on `vX.Y.Z` tags).
 
-> **Phase-3 note:** stdio means the container runs *next to* one MCP client, not as a shared remote service. A `streamable-http` transport mode is planned for phase 3 — that's when this image gains a port, a `HEALTHCHECK`, and true remote serving.
+> **Transport note:** stdio means the container runs *next to* one MCP client, not as a shared remote service. A `streamable-http` transport mode is planned as part of the distribution work on the [Roadmap](#roadmap) — that's when this image gains a port, a `HEALTHCHECK`, and true remote serving.
 
 ## Architecture (demo phase)
 

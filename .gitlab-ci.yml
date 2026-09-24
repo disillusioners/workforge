@@ -18,7 +18,7 @@
 # containers. WorkForge has no GitLab remote/runner yet; this file
 # targets GitLab-default DOCKER executors (gitlab.com shared runners):
 #   * stages are test → build → push (reference: test → build+push);
-#     `build` is the MR validation gate ("Dockerfile must build"),
+#     `build` is the MR/tag validation gate ("Dockerfile must build"),
 #     `push` rebuilds in its own dind and publishes (mainline only, so
 #     mainline does NOT pay a double build)
 #   * test job runs inside an image with uv preinstalled instead of
@@ -82,9 +82,11 @@ test:pytest:
     - uv run pytest tests/ -q -p no:cacheprovider
 
 # ---------------------------------------------------------------------
-# BUILD STAGE — MR validation gate: the Dockerfile must build.
-# No push (MRs have no registry write target by default; mainline is
-# covered by push:image below).
+# BUILD STAGE — validation gate: the Dockerfile must build.
+# Runs on MRs, CI/docker self-test branches, and version tags — a
+# broken Dockerfile must surface at BUILD, not at the registry-
+# publishing step. No push (MRs have no registry write target by
+# default; mainline is covered by push:image below).
 # ---------------------------------------------------------------------
 build:image:
   stage: build
@@ -101,10 +103,12 @@ build:image:
   rules:
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
     - if: '$CI_COMMIT_BRANCH =~ /^feature\/.*docker-ci/'
+    - if: '$CI_COMMIT_TAG =~ /^v\d+\.\d+\.\d+$/'
   script:
     - docker info
     - docker build
-        --build-arg VERSION="$CI_COMMIT_SHORT_SHA"
+        --build-arg VCS_REF="$CI_COMMIT_SHA"
+        --build-arg BUILD_DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
         -t "$CI_REGISTRY_IMAGE:$CI_COMMIT_SHORT_SHA" .
 
 # ---------------------------------------------------------------------
@@ -113,6 +117,9 @@ build:image:
 # convention: test branches never push).
 #   latest branch → :$CI_COMMIT_SHORT_SHA + :latest
 #   vX.Y.Z tag    → :X.Y.Z + :latest
+# VERSION build-arg: package version by default, release tag on
+# vX.Y.Z pipelines — the image's version label always matches the
+# shipped package; VCS_REF/BUILD_DATE carry build provenance.
 # ---------------------------------------------------------------------
 push:image:
   stage: push
@@ -122,20 +129,34 @@ push:image:
   variables:
     DOCKER_TLS_CERTDIR: ""
   interruptible: false
+  retry:
+    max: 1
+    when:
+      - runner_system_failure
+      - stuck_or_timeout_failure
   rules:
     - if: '$CI_COMMIT_BRANCH == "latest"'
     - if: '$CI_COMMIT_TAG =~ /^v\d+\.\d+\.\d+$/'
   script:
+    # set -euo pipefail FIRST: a failed docker push must fail the job —
+    # the trailing echo otherwise swallows the exit code (green build,
+    # unpublished release). ${CI_COMMIT_TAG:-} because set -u aborts on
+    # the unset var on branch pipelines.
+    - set -euo pipefail
     - echo "$CI_REGISTRY_PASSWORD" | docker login -u "$CI_REGISTRY_USER" --password-stdin "$CI_REGISTRY"
     - |
-      if [ -n "$CI_COMMIT_TAG" ]; then
+      if [ -n "${CI_COMMIT_TAG:-}" ]; then
         VERSION="${CI_COMMIT_TAG#v}"
         docker build --build-arg VERSION="$VERSION" \
+          --build-arg VCS_REF="$CI_COMMIT_SHA" \
+          --build-arg BUILD_DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
           -t "$CI_REGISTRY_IMAGE:$VERSION" \
           -t "$CI_REGISTRY_IMAGE:latest" .
         docker push "$CI_REGISTRY_IMAGE:$VERSION"
       else
-        docker build --build-arg VERSION="$CI_COMMIT_SHORT_SHA" \
+        docker build \
+          --build-arg VCS_REF="$CI_COMMIT_SHA" \
+          --build-arg BUILD_DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
           -t "$CI_REGISTRY_IMAGE:$CI_COMMIT_SHORT_SHA" \
           -t "$CI_REGISTRY_IMAGE:latest" .
         docker push "$CI_REGISTRY_IMAGE:$CI_COMMIT_SHORT_SHA"
@@ -143,4 +164,4 @@ push:image:
     - docker push "$CI_REGISTRY_IMAGE:latest"
     - docker logout "$CI_REGISTRY"
     - echo "Pushed:"
-    - if [ -n "$CI_COMMIT_TAG" ]; then echo "  $CI_REGISTRY_IMAGE:$VERSION (+ latest)"; else echo "  $CI_REGISTRY_IMAGE:$CI_COMMIT_SHORT_SHA (+ latest)"; fi
+    - if [ -n "${CI_COMMIT_TAG:-}" ]; then echo "  $CI_REGISTRY_IMAGE:$VERSION (+ latest)"; else echo "  $CI_REGISTRY_IMAGE:$CI_COMMIT_SHORT_SHA (+ latest)"; fi
