@@ -29,3 +29,6 @@ htmlcov/
 
 # Local WorkForge state (never commit user data)
 .workforge/
+
+# Ensemble-internal agent workspace (never track in the public repo)
+.agents/
