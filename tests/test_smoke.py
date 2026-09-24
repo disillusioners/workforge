@@ -357,10 +357,20 @@ def test_pool_shutdown_kills_inflight_promptly(client):
         await call(client, "save_script", name="hang", content=HANG_SCRIPT)
         started = await call(client, "run_script_async", name="hang", timeout_seconds=300)
         # Wait until the job is actually running so _in_flight is populated.
+        # _in_flight is registered AFTER status is flipped to "running" (see
+        # engine._execute), so the status read can race the registration by
+        # a few ms — poll briefly to absorb the gap (test-only; production
+        # callers don't read _in_flight).
         await wait_for_status(client, started["job_id"], {"running"})
-        # Grab the registered Popen so we can verify it gets killed.
-        with engine._in_flight_lock:
-            inflight = list(engine._in_flight.values())
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline:
+            with engine._in_flight_lock:
+                inflight = list(engine._in_flight.values())
+            if inflight:
+                break
+            await asyncio.sleep(0.02)
+        else:
+            inflight = []
         assert inflight, "_in_flight should be populated for the running job"
         proc = inflight[0]
 
