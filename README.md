@@ -4,16 +4,16 @@
 
 WorkForge turns "can you run this snippet for me?" into a first-class MCP toolset. An AI agent (Claude Desktop, Cursor, or any MCP client) can persist a Python script under a stable name, execute it synchronously and get the result back, or launch it in the background and poll status / tail the live log while it runs. Jobs are durable — every run gets an ID and its output is written to disk, so **completed** logs and results survive restarts. (In-flight async jobs do NOT survive: a process restart kills any job that was still running and leaves no record of the partial run — by design, demo-phase only.)
 
-- **MCP-native** — built on [FastMCP](https://github.com/jlowin/fastmcp), speaks stdio MCP: works with Claude Desktop, Cursor, and any MCP client.
+- **MCP-native** — built on [FastMCP](https://github.com/jlowin/fastmcp): works with Claude Desktop, Cursor, and any MCP client. stdio by default; `streamable-http` / `sse` for remote serving.
 - **Sync *and* async execution** — block until done, or fire-and-forget with live log streaming.
 - **Durable by default** — scripts and job records live under one home directory (`WORKFORGE_HOME`, default `~/.workforge`).
 - **Persistent run history (optional)** — set `WORKFORGE_DATABASE_URL` and every run is recorded in Postgres, queryable via the `list_history` / `history_detail` tools.
 - **Tiny** — one dependency, ~a few hundred lines of readable Python.
 
 > ## ⚠️ Demo phase — no sandbox
-> **WorkForge is currently a demo: scripts run as plain subprocesses with YOUR full user privileges. There is no sandboxing, no authentication, and no resource limiting.**
+> **WorkForge is currently a demo: scripts run as plain subprocesses with YOUR full user privileges. There is no sandboxing and no resource limiting.**
 > Do not point it at untrusted scripts or expose it to untrusted agents. Treat every `run_script` call as if you typed it into your own terminal.
-> Sandboxing, auth, and remote workers are planned for phase 2 (see [Roadmap](#roadmap)).
+> For HTTP transports there is an optional shared-token check (`WORKFORGE_AUTH_TOKEN`, see [Remote serving](#remote-serving)) — **strongly recommended for any non-localhost bind**. Sandboxing and resource limiting remain open roadmap items (see [Roadmap](#roadmap)).
 
 > **Platform note:** Windows support is best-effort and untested; first-class targets are macOS and Linux (see project classifiers).
 
@@ -30,7 +30,7 @@ uv run workforge # starts the MCP server on stdio
 
 If the `workforge` command isn't on your PATH, `python -m workforge` (inside the project venv, e.g. `uv run python -m workforge`) starts the same server.
 
-The server speaks MCP over stdio and is meant to be launched *by your MCP client*, not by hand.
+The server speaks MCP over stdio by default and is meant to be launched *by your MCP client*, not by hand. To serve remote agents over HTTP instead, see [Remote serving](#remote-serving).
 
 ### Optional: keep state elsewhere
 
@@ -71,6 +71,68 @@ Add to `~/.cursor/mcp.json` (or Cursor → Settings → MCP → Add server):
 ```
 
 Replace `/absolute/path/to/workforge` with the real cloned path. To give the server a custom home, add an `env` block: `"env": { "WORKFORGE_HOME": "/path/to/home" }`.
+
+## Remote serving
+
+`workforge` serves MCP over **stdio by default** — existing configs observe zero change. For remote agents (a shared server many clients hit over the network), switch to an HTTP transport:
+
+```bash
+# streamable-http (modern, recommended): serves the MCP endpoint at /mcp
+workforge --transport streamable-http --host 0.0.0.0 --port 8000
+
+# legacy SSE: serves the MCP endpoint at /sse
+workforge --transport sse --host 0.0.0.0 --port 8000
+```
+
+| Transport | Flag | MCP endpoint URL | Notes |
+|---|---|---|---|
+| stdio *(default)* | `--transport stdio` | — (stdin/stdout) | One client per process; unchanged behavior. |
+| streamable-http | `--transport streamable-http` | `http://host:8000/mcp` | Recommended remote transport. |
+| sse | `--transport sse` | `http://host:8000/sse` | Legacy; for clients that only speak SSE. |
+
+Defaults: `host=127.0.0.1` (localhost-only), `port=8000`. Every flag has an env equivalent — `WORKFORGE_TRANSPORT` / `WORKFORGE_HOST` / `WORKFORGE_PORT` — with CLI flag > env > default precedence. An invalid transport value (flag or env) is a clean usage error, not a traceback. The tools themselves are byte-identical across transports: same names, same arguments, same returns.
+
+All three transports expose an unauthenticated `GET /health` route returning `{"status": "ok", ...}` (used by the container `HEALTHCHECK`).
+
+### Securing a remote server (do this first)
+
+**There is no sandbox: anyone who can reach the MCP endpoint can execute arbitrary code with the server user's full privileges.** Before binding to anything but localhost, set a shared bearer token:
+
+```bash
+export WORKFORGE_AUTH_TOKEN="$(python -c 'import secrets; print(secrets.token_urlsafe(32))')"
+workforge --transport streamable-http --host 0.0.0.0
+```
+
+Every MCP request must then carry `Authorization: Bearer <token>` — requests with a missing or wrong token are rejected with `401` (comparison is constant-time). MCP clients that let you set HTTP headers pass it via `"headers": {"Authorization": "Bearer <token>"}` in their config. Two safety nets are built in:
+
+- Binding a non-localhost address **without** a token prints a loud multi-line warning to stderr and refuses nothing — the server still starts (explicit operator choice), but you have been warned.
+- Setting `WORKFORGE_AUTH_TOKEN` with stdio transport has no effect (stdio has no HTTP surface); the server prints a one-line note that the token is ignored.
+
+### Attaching remote MCP clients
+
+Generic JSON config (Claude Desktop / Cursor HTTP-style; adjust `url` and add the header when a token is set):
+
+```json
+{
+  "mcpServers": {
+    "workforge": {
+      "url": "http://your-host:8000/mcp",
+      "headers": { "Authorization": "Bearer <your-token>" }
+    }
+  }
+}
+```
+
+Python (fastmcp client):
+
+```python
+from fastmcp import Client
+from fastmcp.client.transports import StreamableHttpTransport  # or SSETransport
+
+transport = StreamableHttpTransport("http://your-host:8000/mcp", auth="<your-token>")
+async with Client(transport) as client:
+    tools = await client.list_tools()
+```
 
 ## Tools
 
@@ -127,7 +189,7 @@ The schema (`job_runs` plus `created_at`/`script_name` indexes) is also ensured 
 
 ## Deployment (Docker)
 
-WorkForge ships as a multi-stage Docker image (`python:3.12-slim-bookworm` base, non-root user, ~no extra OS packages — `psycopg[binary]` bundles libpq). The server still speaks **MCP over stdio**, so "deploying" it means attaching your MCP client to the container's stdin/stdout.
+WorkForge ships as a multi-stage Docker image (`python:3.12-slim-bookworm` base, non-root user, ~no extra OS packages — `psycopg[binary]` bundles libpq). **The container serves MCP over streamable-http on `0.0.0.0:8000` by default** (`EXPOSE 8000` + a stdlib-only `HEALTHCHECK` probing the unauthenticated `/health` route) — see [Remote serving](#remote-serving) for client URLs and token auth. stdio mode stays one flag away: `--transport stdio` (CLI flags override the image's ENVs).
 
 ### Build & run
 
@@ -135,38 +197,46 @@ WorkForge ships as a multi-stage Docker image (`python:3.12-slim-bookworm` base,
 # From the repo root:
 docker build -t workforge:0.1.0 .
 
-# Quick check — the server answers an MCP initialize on stdio:
+# Run as a shared remote MCP server (HTTP, mapped to host port 8000):
+docker run -d --rm -p 8000:8000 -v workforge-data:/data/workforge workforge:0.1.0
+
+# Health check from the host:
+curl -s http://localhost:8000/health   # → {"status": "ok", ...}
+
+# stdio smoke check — the server answers an MCP initialize on stdin/stdout:
 echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"smoke","version":"0.0.0"}}}' \
-  | docker run --rm -i workforge:0.1.0
+  | docker run --rm -i workforge:0.1.0 --transport stdio
 ```
 
 State lives under `WORKFORGE_HOME=/data/workforge` inside the container, declared as a `VOLUME` — mount a named volume so saved scripts and job records survive container replacement:
 
 ```bash
-docker run --rm -i -v workforge-data:/data/workforge workforge:0.1.0
+docker run -d --rm -p 8000:8000 -v workforge-data:/data/workforge workforge:0.1.0
 ```
 
 ### Attaching an MCP client (stdio)
 
-The image's entrypoint is the `workforge` CLI, so MCP clients launch it directly with `docker run -i` (keep `-i` — that's the stdio pipe). Claude Desktop / Cursor config:
+The image's entrypoint is the `workforge` CLI, so MCP clients launch it directly with `docker run -i` (keep `-i` — that's the stdio pipe). stdio is no longer the container default, so pass `--transport stdio` explicitly. Claude Desktop / Cursor config:
 
 ```json
 {
   "mcpServers": {
     "workforge": {
       "command": "docker",
-      "args": ["run", "--rm", "-i", "-v", "workforge-data:/data/workforge", "workforge:0.1.0"]
+      "args": ["run", "--rm", "-i", "-v", "workforge-data:/data/workforge", "workforge:0.1.0", "--transport", "stdio"]
     }
   }
 }
 ```
+
+For a shared HTTP deployment, point the client at the mapped port instead (see [Remote serving](#remote-serving)) — run the container with `-p 8000:8000` and `-e WORKFORGE_AUTH_TOKEN=...`, then set `"url": "http://localhost:8000/mcp"` with the matching `Authorization` header.
 
 ### Optional: run history against a remote Postgres
 
 Pass a **TCP DSN** (containers can't reach your host's unix socket by default):
 
 ```bash
-docker run --rm -i \
+docker run -d --rm -p 8000:8000 \
   -v workforge-data:/data/workforge \
   -e WORKFORGE_DATABASE_URL=postgresql://user:pass@db-host:5432/workforge \
   workforge:0.1.0
@@ -184,7 +254,7 @@ docker run --rm \
 
 `.gitlab-ci.yml` (stages: `test → build → push`) runs the pytest suite from source, validates the Dockerfile builds on MRs, and publishes to `$CI_REGISTRY_IMAGE` with `:$CI_COMMIT_SHORT_SHA` + `:latest` tags on the `latest` branch (plus `:X.Y.Z` on `vX.Y.Z` tags).
 
-> **Transport note:** stdio means the container runs *next to* one MCP client, not as a shared remote service. A `streamable-http` transport mode is planned as part of the distribution work on the [Roadmap](#roadmap) — that's when this image gains a port, a `HEALTHCHECK`, and true remote serving.
+> **Transport note:** the image now serves MCP over **streamable-http on `0.0.0.0:8000` by default** with a `HEALTHCHECK` (`/health`) — see [Remote serving](#remote-serving) for URLs and token auth. stdio (one client attached to stdin/stdout) stays available with `--transport stdio`.
 
 ## Architecture (demo phase)
 
@@ -203,7 +273,8 @@ Async jobs share the sync execution path: a small thread pool starts each job as
 ## Roadmap
 
 - **Phase 2 — run history:** ✅ shipped — persistent run history in Postgres (`list_history` / `history_detail`, guarded `db-init`, fail-safe engine writes).
-- **Phase 2 — hardening:** sandboxed execution (containers / restricted privileges), authentication, resource limits (CPU/memory/disk), output truncation policies.
+- **Phase 4 — HTTP transports:** ✅ shipped — `streamable-http` + `sse` remote serving with optional shared-token auth (`WORKFORGE_AUTH_TOKEN`, constant-time compare), unauthenticated `/health` probe, container default flipped to HTTP with `EXPOSE` + `HEALTHCHECK`; stdio unchanged as the CLI default.
+- **Phase 2 — hardening:** sandboxed execution (containers / restricted privileges), resource limits (CPU/memory/disk), output truncation policies; stronger auth than the static shared token (per-client identities / OAuth) if remote serving sticks.
 - **Phase 2 — distribution:** remote workers (run jobs on another machine), multi-agent job queues, job cancellation.
 - **Phase 3 — ergonomics:** script versioning, cron/scheduled runs, a small web UI for job history.
 
