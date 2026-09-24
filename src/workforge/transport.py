@@ -27,6 +27,7 @@ import os
 import secrets
 import sys
 from dataclasses import dataclass
+from ipaddress import ip_address
 
 from fastmcp.server.auth import AccessToken, TokenVerifier
 
@@ -132,11 +133,19 @@ class StaticBearerVerifier(TokenVerifier):
 
 
 def is_loopback_host(host: str) -> bool:
-    """True for hosts that only expose the server to this machine."""
+    """True for hosts that only expose the server to this machine.
+
+    Uses :mod:`ipaddress` so unparseable strings (e.g. ``"127.0.0.1.evil.com"``)
+    fall through to ``False`` instead of being accepted because of a naive prefix
+    match.
+    """
     normalized = host.strip("[]").lower()
-    return (
-        normalized in {"localhost", "::1"} or normalized.startswith("127.")
-    )
+    if normalized == "localhost":
+        return True
+    try:
+        return ip_address(normalized).is_loopback
+    except ValueError:
+        return False
 
 
 def warn_unauthenticated_remote(config: TransportConfig) -> None:
@@ -194,6 +203,7 @@ def serve(config: TransportConfig, *, show_banner: bool = False) -> None:
         mcp.run(transport="stdio", show_banner=show_banner)
         return
 
+    # order matters: /health route + mcp.auth are both read once at mcp.run() app-build time
     register_health_route(mcp)
 
     if config.auth_token:

@@ -339,6 +339,12 @@ class TestConfigResolution:
         assert not is_loopback_host("0.0.0.0")
         assert not is_loopback_host("::")
         assert not is_loopback_host("192.168.1.10")
+        # defense-in-depth: prefix-matching hostnames must NOT be loopback
+        assert not is_loopback_host("127.0.0.1.evil.com")
+        # case-insensitive hostname allowlist (lowercased before compare)
+        assert is_loopback_host("LOCALHOST")
+        # hostnames that merely end in loopback substrings must NOT match
+        assert not is_loopback_host("localhost.evil.com")
 
 
 # --------------------------------------------- streamable-http serving
