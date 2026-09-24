@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1
 # =====================================================================
-# WorkForge image (FastMCP stdio MCP server + worker system)
+# WorkForge image (FastMCP MCP server + worker system)
 #
 # Build (from repo root):
 #   docker build -t workforge:0.1.0 .
@@ -11,10 +11,24 @@
 #     --build-arg BUILD_DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ) \
 #     -t workforge:0.1.0 .
 #
-# Run (stdio MCP server — the MCP client attaches via stdin/stdout):
-#   docker run --rm -i \
+# Run (default: streamable-http MCP server on 0.0.0.0:8000):
+#   docker run -d --rm -p 8000:8000 \
 #     -v workforge-data:/data/workforge \
 #     workforge:0.1.0
+#   → MCP endpoint http://localhost:8000/mcp (SSE: /sse via
+#     --transport sse), health probe http://localhost:8000/health
+#
+# Remote serving STRONGLY wants a token (scripts run unsandboxed with
+# the container user's privileges):
+#   docker run -d --rm -p 8000:8000 \
+#     -v workforge-data:/data/workforge \
+#     -e WORKFORGE_AUTH_TOKEN=<long-random-secret> \
+#     workforge:0.1.0
+#
+# stdio MCP server (the MCP client attaches via stdin/stdout):
+#   docker run --rm -i \
+#     -v workforge-data:/data/workforge \
+#     workforge:0.1.0 --transport stdio
 #
 # Optional run history (Postgres, TCP DSN from a container):
 #   -e WORKFORGE_DATABASE_URL=postgresql://user:pass@host:5432/workforge
@@ -37,8 +51,10 @@
 #   so `uv sync` installs the project itself (editable). The runtime
 #   stage therefore copies BOTH the built .venv and src/ — at the exact
 #   path /app/src the editable install points at.
-# * No EXPOSE / HEALTHCHECK: the server speaks MCP over stdio, there is
-#   no network listener to expose or probe.
+# * Container default is HTTP serving (streamable-http on 0.0.0.0:8000,
+#   see ENV below): EXPOSE + a curl-free HEALTHCHECK probe the
+#   unauthenticated /health route. CLI flags override these ENVs, so
+#   `--transport stdio` restores the phase-1 behavior unchanged.
 # =====================================================================
 
 # ---------- Stage 1: dependency builder ----------
@@ -86,7 +102,10 @@ WORKDIR /app
 
 ENV PYTHONUNBUFFERED=1 \
     PATH="/app/.venv/bin:$PATH" \
-    WORKFORGE_HOME=/data/workforge
+    WORKFORGE_HOME=/data/workforge \
+    WORKFORGE_TRANSPORT=streamable-http \
+    WORKFORGE_HOST=0.0.0.0 \
+    WORKFORGE_PORT=8000
 
 # Virtualenv (pinned deps + editable workforge install) plus the source
 # tree that install points at. tests/, .git, .agents, .venv never enter
@@ -97,6 +116,16 @@ COPY --chown=workforge:workforge src/ /app/src/
 # Durable state (scripts/, jobs/): mount a named volume here or job
 # records vanish with the container.
 VOLUME /data/workforge
+
+# MCP endpoint served on $WORKFORGE_PORT (streamable-http default).
+EXPOSE 8000
+
+# Container healthcheck. python:3.12-slim ships no curl/wget, so probe
+# the unauthenticated /health route with the stdlib. Shell form (not
+# exec) so $WORKFORGE_PORT is read per-probe; 127.0.0.1 reaches the
+# 0.0.0.0 bind. start-period covers uvicorn's startup.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+    CMD python -c "import os,urllib.request; urllib.request.urlopen('http://127.0.0.1:%s/health' % os.environ.get('WORKFORGE_PORT', '8000'), timeout=4).read(1)"
 
 USER workforge
 
@@ -118,6 +147,8 @@ LABEL org.opencontainers.image.title="WorkForge" \
       org.opencontainers.image.source="https://github.com/disillusioners/workforge" \
       org.opencontainers.image.base.name="docker.io/library/python:3.12-slim-bookworm"
 
-# No args = stdio MCP server. Subcommands pass through:
+# No args = streamable-http MCP server on 0.0.0.0:8000 (override via ENV
+# or CLI flags). stdio stays available: --transport stdio. Subcommands
+# pass through:
 #   docker run --rm ... workforge:TAG db-init
 ENTRYPOINT ["workforge"]
