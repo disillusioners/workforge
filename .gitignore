@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+*.egg
+build/
+dist/
+.eggs/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Test / tooling caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# uv: uv.lock IS committed on purpose (reproducible installs)
+
+# Editors / OS
+.idea/
+.vscode/
+.DS_Store
+
+# Local WorkForge state (never commit user data)
+.workforge/
