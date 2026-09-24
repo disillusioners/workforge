@@ -32,7 +32,7 @@ def test_async_lifecycle_streams_partial_logs_then_finalizes(client):
 
         started = await call(client, "run_script_async", name="lifecycle")
         job_id = started["job_id"]
-        assert JOB_ID_RE.match(job_id)
+        assert JOB_ID_RE.fullmatch(job_id)
         assert started["status"] in {"queued", "running"}
 
         # Poll to a terminal state, keeping the best mid-run log sample.

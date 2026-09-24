@@ -11,6 +11,9 @@ demo-grade, no external queue.
 
 Timeouts: on expiry the entire process group is SIGKILLed and the job is
 marked ``failed`` with a timeout note. A job never hangs the server.
+
+Signal handlers (SIGINT/SIGTERM) are installed at import time — see
+:func:`_install_signal_handlers` below.
 """
 
 from __future__ import annotations
@@ -23,7 +26,7 @@ import sys
 import threading
 import time
 import uuid
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
@@ -43,6 +46,12 @@ _pool_failed = False
 # job completes — these hooks break that wait.
 _in_flight: dict[str, subprocess.Popen] = {}
 _in_flight_lock = threading.Lock()
+
+# job_id -> (meta, future) for jobs submitted to the pool but not yet picked
+# up by a worker. Lets shutdown finalize futures dropped by
+# cancel_futures=True instead of stranding them on disk as "queued" forever.
+_pending: dict[str, tuple[dict[str, Any], Future]] = {}
+_pending_lock = threading.Lock()
 
 
 def _get_pool() -> ThreadPoolExecutor:
@@ -72,14 +81,26 @@ def _shutdown_pool() -> None:
     with _in_flight_lock:
         inflight = list(_in_flight.values())
     for proc in inflight:
-        try:
-            proc.kill()
-        except (OSError, ProcessLookupError):
-            pass
+        # Group kill: a bare proc.kill() would orphan the script's own
+        # children. _kill_tree tolerates races with children that already
+        # exited (ProcessLookupError/ESRCH) without raising.
+        _kill_tree(proc)
     if pool is not None:
+        with _pending_lock:
+            pending = list(_pending.values())
+            _pending.clear()
         # cancel_futures drops queued work; wait=False lets our own cleanup
         # return promptly. The reader threads are daemon, so they vanish.
         pool.shutdown(wait=False, cancel_futures=True)
+        # A job still queued here had its future cancelled before _execute
+        # ever ran — finalize it so it doesn't sit on disk as "queued".
+        for meta, future in pending:
+            if not future.cancelled():
+                continue  # already started/completed; _execute finalizes it
+            meta["status"] = "failed"
+            meta["finished_at"] = storage.now_iso()
+            meta["error"] = "interrupted: shutdown before start"
+            _safe_write_job_meta(meta)
 
 
 atexit.register(_shutdown_pool)
@@ -89,8 +110,10 @@ def _install_signal_handlers() -> None:
     """Replace SIGINT/SIGTERM so a hung pool cannot block shutdown."""
     def _handler(signum, _frame):
         _shutdown_pool()
-        # Restore default handler and re-raise so the standard exit flow
-        # still runs (KeyboardInterrupt, clean termination).
+        # Re-deliver the signal to this process: after restoring SIG_DFL,
+        # os.kill sends the same signal again and the OS default action
+        # (terminate) takes over — this Python handler has done its shutdown
+        # work and must not run a second time.
         try:
             signal.signal(signum, signal.SIG_DFL)
         except (ValueError, OSError):
@@ -145,7 +168,9 @@ def submit(name: str, args: list[Any], timeout_seconds: int) -> dict[str, Any]:
     meta = _new_meta(name, args, timeout_seconds)
     storage.write_job_meta(meta)
     try:
-        _get_pool().submit(_execute, meta)
+        future = _get_pool().submit(_execute, meta)
+        with _pending_lock:
+            _pending[meta["job_id"]] = (meta, future)
     except RuntimeError as exc:
         # Pool is broken (e.g. after interpreter shutdown); flag it so the
         # next submission builds a fresh pool instead of reusing a dead
@@ -206,6 +231,10 @@ def _execute(meta: dict[str, Any]) -> None:
     Any failure in here (e.g. the process cannot be spawned at all) finalizes
     the job as ``failed`` so it never sits on disk stuck in ``running``.
     """
+    # No longer queued: deregister so a concurrent shutdown won't finalize
+    # this job as cancelled before _execute starts updating its meta.
+    with _pending_lock:
+        _pending.pop(meta["job_id"], None)
     job_d = storage.job_dir(meta["job_id"])
     # Captures + start time live OUTSIDE the try so the except handler can
     # hoist them even if proc.wait() / reader joins raise mid-flight. Without
