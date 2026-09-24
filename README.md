@@ -125,6 +125,67 @@ The schema (`job_runs` plus `created_at`/`script_name` indexes) is also ensured 
 - **History is optional and fail-safe.** Unset, everything works exactly as before (the history tools raise a structured "not configured" error). With it set, a Postgres outage never fails a running job — the failure is recorded as `history_write_error` in the job's `meta.json` and the job completes normally. All history operations use short connect/query timeouts (~5s), so a dead database can never hang a tool or a job.
 - Tests target the `workforge_test` database only (`tests/test_history.py`) and skip automatically when Postgres is unreachable.
 
+## Deployment (Docker)
+
+WorkForge ships as a multi-stage Docker image (`python:3.12-slim-bookworm` base, non-root user, ~no extra OS packages — `psycopg[binary]` bundles libpq). The server still speaks **MCP over stdio**, so "deploying" it means attaching your MCP client to the container's stdin/stdout.
+
+### Build & run
+
+```bash
+# From the repo root:
+docker build -t workforge:0.1.0 .
+
+# Quick check — the server answers an MCP initialize on stdio:
+echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"smoke","version":"0.0.0"}}}' \
+  | docker run --rm -i workforge:0.1.0
+```
+
+State lives under `WORKFORGE_HOME=/data/workforge` inside the container, declared as a `VOLUME` — mount a named volume so saved scripts and job records survive container replacement:
+
+```bash
+docker run --rm -i -v workforge-data:/data/workforge workforge:0.1.0
+```
+
+### Attaching an MCP client (stdio)
+
+The image's entrypoint is the `workforge` CLI, so MCP clients launch it directly with `docker run -i` (keep `-i` — that's the stdio pipe). Claude Desktop / Cursor config:
+
+```json
+{
+  "mcpServers": {
+    "workforge": {
+      "command": "docker",
+      "args": ["run", "--rm", "-i", "-v", "workforge-data:/data/workforge", "workforge:0.1.0"]
+    }
+  }
+}
+```
+
+### Optional: run history against a remote Postgres
+
+Pass a **TCP DSN** (containers can't reach your host's unix socket by default):
+
+```bash
+docker run --rm -i \
+  -v workforge-data:/data/workforge \
+  -e WORKFORGE_DATABASE_URL=postgresql://user:pass@db-host:5432/workforge \
+  workforge:0.1.0
+```
+
+One-time bootstrap (`workforge-db-init` is also available via `--entrypoint workforge-db-init`; the `db-init` subcommand is the same guarded path — it can only ever create a database named `workforge` or `workforge_test`, never drop or touch anything else):
+
+```bash
+docker run --rm \
+  -e WORKFORGE_DATABASE_URL=postgresql://user:pass@db-host:5432/workforge \
+  workforge:0.1.0 db-init
+```
+
+### CI
+
+`.gitlab-ci.yml` (stages: `test → build → push`) runs the pytest suite from source, validates the Dockerfile builds on MRs, and publishes to `$CI_REGISTRY_IMAGE` with `:$CI_COMMIT_SHORT_SHA` + `:latest` tags on the `latest` branch (plus `:X.Y.Z` on `vX.Y.Z` tags).
+
+> **Phase-3 note:** stdio means the container runs *next to* one MCP client, not as a shared remote service. A `streamable-http` transport mode is planned for phase 3 — that's when this image gains a port, a `HEALTHCHECK`, and true remote serving.
+
 ## Architecture (demo phase)
 
 ```

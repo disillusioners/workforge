@@ -1,0 +1,44 @@
+# =====================================================================
+# .dockerignore — keeps the build context (repo root) small and
+# secret-free for `docker build -t workforge:… .`
+# (structure follows yedda-agent-fleet's .dockerignore)
+#
+# README.md and LICENSE are NOT ignored: hatchling reads them while
+# building the workforge package metadata in the builder stage.
+# =====================================================================
+
+# --- VCS / agent / CI tooling (never needed inside images) ---
+.git
+.gitignore
+.agents
+.pytest_cache
+.ruff_cache
+.mypy_cache
+__pycache__
+**/__pycache__
+
+# --- Secrets & env files: NEVER into build context or images ---
+# Runtime config is injected via env vars (-e WORKFORGE_HOME=...,
+# -e WORKFORGE_DATABASE_URL=...), never baked in.
+.env
+.env.*
+!.env.example
+
+# --- Virtualenvs / build outputs ---
+.venv
+**/.venv
+build
+dist
+*.egg-info
+
+# --- Tests: CI runs them from source; the runtime image never ships them ---
+tests
+tests/**
+
+# --- Local WorkForge state (user data — never ship) ---
+.workforge
+
+# --- OS junk / logs ---
+.DS_Store
+**/.DS_Store
+*.log
