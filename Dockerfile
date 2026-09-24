@@ -55,6 +55,12 @@
 #   see ENV below): EXPOSE + a curl-free HEALTHCHECK probe the
 #   unauthenticated /health route. CLI flags override these ENVs, so
 #   `--transport stdio` restores the phase-1 behavior unchanged.
+# * The non-loopback bind is gated: starting this image with the default
+#   ENVs and NO token fails at boot with exit-2 (the gate refuses to
+#   expose an unsandboxed MCP server publicly without auth). Always
+#   pass `-e WORKFORGE_AUTH_TOKEN=...` for production; the documented
+#   `-e WORKFORGE_ALLOW_UNAUTHENTICATED=1` escape hatch exists for
+#   isolated/trusted networks only and prints a loud warning.
 # =====================================================================
 
 # ---------- Stage 1: dependency builder ----------

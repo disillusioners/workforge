@@ -13,7 +13,7 @@ WorkForge turns "can you run this snippet for me?" into a first-class MCP toolse
 > ## ⚠️ Demo phase — no sandbox
 > **WorkForge is currently a demo: scripts run as plain subprocesses with YOUR full user privileges. There is no sandboxing and no resource limiting.**
 > Do not point it at untrusted scripts or expose it to untrusted agents. Treat every `run_script` call as if you typed it into your own terminal.
-> For HTTP transports there is an optional shared-token check (`WORKFORGE_AUTH_TOKEN`, see [Remote serving](#remote-serving)) — **strongly recommended for any non-localhost bind**. Sandboxing and resource limiting remain open roadmap items (see [Roadmap](#roadmap)).
+> For HTTP transports there is a shared-token check (`WORKFORGE_AUTH_TOKEN`, see [Remote serving](#remote-serving)) — **required for any HTTP bind** (the token stops a remote caller from reaching the MCP endpoint; the in-process DNS-rebinding middleware closes the loopback-spoof gap but does nothing against a non-loopback network bind, and WorkForge refuses to start one without a token). Sandboxing and resource limiting remain open roadmap items (see [Roadmap](#roadmap)).
 
 > **Platform note:** Windows support is best-effort and untested; first-class targets are macOS and Linux (see project classifiers).
 
@@ -92,7 +92,7 @@ workforge --transport sse --host 0.0.0.0 --port 8000
 
 Defaults: `host=127.0.0.1` (localhost-only), `port=8000`. Every flag has an env equivalent — `WORKFORGE_TRANSPORT` / `WORKFORGE_HOST` / `WORKFORGE_PORT` — with CLI flag > env > default precedence. An invalid transport value (flag or env) is a clean usage error, not a traceback. The tools themselves are byte-identical across transports: same names, same arguments, same returns.
 
-All three transports expose an unauthenticated `GET /health` route returning `{"status": "ok", ...}` (used by the container `HEALTHCHECK`).
+All three transports expose an unauthenticated `GET /health` route returning exactly `{"status": "ok"}` (used by the container `HEALTHCHECK`). The body deliberately omits any version or build fingerprint.
 
 ### Securing a remote server (do this first)
 
@@ -102,6 +102,12 @@ All three transports expose an unauthenticated `GET /health` route returning `{"
 export WORKFORGE_AUTH_TOKEN="$(python -c 'import secrets; print(secrets.token_urlsafe(32))')"
 workforge --transport streamable-http --host 0.0.0.0
 ```
+
+Then connect with `Authorization: Bearer <token>` (the scheme match is case-insensitive — `bearer` works the same as `Bearer`). The `/health` route stays unauthenticated so the container `HEALTHCHECK` can probe it.
+
+**DNS-rebinding protection is on by default.** Every HTTP bind installs fastmcp's `HostOriginGuardMiddleware` (mode `auto`) so a browser-side page that tries to reach the MCP endpoint with a spoofed `Host` header is rejected with `HTTP 421 Misdirected Request` — closing the loopback DNS-rebinding gap.
+
+**Non-loopback bind without a token: refused with a clean exit-2.** WorkForge refuses to start an HTTP/SSE bind on `0.0.0.0` (or any non-loopback host) without `WORKFORGE_AUTH_TOKEN` — the operator must set a token or explicitly opt in with `WORKFORGE_ALLOW_UNAUTHENTICATED=1` (loud warning still fires). The gate is to stop a silent RCE if the container gets exposed publicly. Loopback binds remain allowed without a token (the DNS-rebinding middleware covers that threat) and stdio is never gated (no HTTP surface).
 
 Every MCP request must then carry `Authorization: Bearer <token>` — requests with a missing or wrong token are rejected with `401` (comparison is constant-time). MCP clients that let you set HTTP headers pass it via `"headers": {"Authorization": "Bearer <token>"}` in their config. Two safety nets are built in:
 
@@ -126,12 +132,21 @@ Generic JSON config (Claude Desktop / Cursor HTTP-style; adjust `url` and add th
 Python (fastmcp client):
 
 ```python
+import asyncio
+
 from fastmcp import Client
 from fastmcp.client.transports import StreamableHttpTransport  # or SSETransport
 
-transport = StreamableHttpTransport("http://your-host:8000/mcp", auth="<your-token>")
-async with Client(transport) as client:
-    tools = await client.list_tools()
+
+async def main():
+    transport = StreamableHttpTransport(
+        "http://your-host:8000/mcp", auth="<your-token>"
+    )
+    async with Client(transport) as client:
+        tools = await client.list_tools()
+
+
+asyncio.run(main())
 ```
 
 ## Tools
@@ -198,10 +213,23 @@ WorkForge ships as a multi-stage Docker image (`python:3.12-slim-bookworm` base,
 docker build -t workforge:0.1.0 .
 
 # Run as a shared remote MCP server (HTTP, mapped to host port 8000):
-docker run -d --rm -p 8000:8000 -v workforge-data:/data/workforge workforge:0.1.0
+# WORKFORGE_AUTH_TOKEN is REQUIRED for any non-loopback bind — the gate
+# refuses to start without it. Substitute a long random secret.
+docker run -d --rm -p 8000:8000 \
+  -v workforge-data:/data/workforge \
+  -e WORKFORGE_AUTH_TOKEN=<long-random-secret> \
+  workforge:0.1.0
 
 # Health check from the host:
-curl -s http://localhost:8000/health   # → {"status": "ok", ...}
+curl -s http://localhost:8000/health   # → {"status": "ok"}
+
+# Escape hatch (isolated / trusted networks only): opt in to unauthenticated
+# 0.0.0.0 binds. A loud warning still fires on every start so the choice
+# is visible in the logs.
+# docker run -d --rm -p 8000:8000 \
+#   -v workforge-data:/data/workforge \
+#   -e WORKFORGE_ALLOW_UNAUTHENTICATED=1 \
+#   workforge:0.1.0
 
 # stdio smoke check — the server answers an MCP initialize on stdin/stdout:
 echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"smoke","version":"0.0.0"}}}' \
@@ -211,7 +239,10 @@ echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":
 State lives under `WORKFORGE_HOME=/data/workforge` inside the container, declared as a `VOLUME` — mount a named volume so saved scripts and job records survive container replacement:
 
 ```bash
-docker run -d --rm -p 8000:8000 -v workforge-data:/data/workforge workforge:0.1.0
+docker run -d --rm -p 8000:8000 \
+  -v workforge-data:/data/workforge \
+  -e WORKFORGE_AUTH_TOKEN=<long-random-secret> \
+  workforge:0.1.0
 ```
 
 ### Attaching an MCP client (stdio)

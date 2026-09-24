@@ -8,6 +8,7 @@ HTTP — the same path a remote agent would take. No fixed ports, no CI races.
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import socket
 import subprocess
@@ -25,7 +26,10 @@ from workforge.transport import (
     DEFAULT_HOST,
     DEFAULT_PORT,
     DEFAULT_TRANSPORT,
+    ENV_ALLOW_UNAUTHENTICATED,
+    TransportConfig,
     TransportConfigError,
+    enforce_remote_auth_gate,
     is_loopback_host,
     note_stdio_auth_ignored,
     resolve_config,
@@ -87,15 +91,18 @@ def spawn_server(home, transport, port, host="127.0.0.1", extra_env=None,
 
 
 def wait_healthy(proc, port, deadline_s: float = 20.0) -> None:
-    """Poll /health until the server answers or the process dies."""
+    """Poll /health until the server answers or the process dies.
+
+    Bounded by ``deadline_s`` (default 20s). On early exit, captures
+    stderr with a tight timeout — never blocks indefinitely.
+    """
     end = time.monotonic() + deadline_s
     url = f"http://127.0.0.1:{port}/health"
     while time.monotonic() < end:
         if proc.poll() is not None:
-            stderr = ""
-            if proc.stderr is not None:
-                stderr = proc.stderr.read().decode(errors="replace")
-            pytest.fail(f"server exited early rc={proc.returncode}\n{stderr}")
+            pytest.fail(
+                f"server exited early rc={proc.returncode}\n{_read_stderr(proc)}"
+            )
         try:
             with urllib.request.urlopen(url, timeout=1) as response:
                 if response.status == 200:
@@ -105,6 +112,36 @@ def wait_healthy(proc, port, deadline_s: float = 20.0) -> None:
     pytest.fail(f"server did not become healthy within {deadline_s}s")
 
 
+def _read_stderr(proc) -> str:
+    """Bounded stderr read — never blocks more than ~3s.
+
+    Plain ``proc.stderr.read()`` can hang indefinitely if the child is
+    alive and idle, because POSIX ``subprocess`` does NOT spawn a
+    background drainer thread (unlike the Windows path). This helper
+    does a bounded wait-then-read in a worker thread so a misbehaving
+    subprocess can't pin the test forever.
+    """
+    if proc.stderr is None:
+        return ""
+    import threading
+
+    holder: list[str] = []
+
+    def _drain() -> None:
+        try:
+            data = proc.stderr.read()
+            holder.append(data.decode(errors="replace"))
+        except Exception:
+            holder.append("")
+
+    th = threading.Thread(target=_drain, daemon=True)
+    th.start()
+    th.join(3.0)
+    if th.is_alive():
+        return "[stderr read timed out]"
+    return holder[0] if holder else ""
+
+
 def stop_server(proc) -> None:
     proc.terminate()
     try:
@@ -112,6 +149,44 @@ def stop_server(proc) -> None:
     except subprocess.TimeoutExpired:
         proc.kill()
         proc.wait(timeout=5)
+
+
+def drain_stderr(proc) -> str:
+    """Read stderr after the process exits — bounded.
+
+    The POSIX ``subprocess`` module does NOT spawn a background drainer
+    thread for stderr=PIPE (unlike the Windows path), so plain
+    ``proc.stderr.read()`` on a still-alive child blocks forever waiting
+    for data that may never come. After ``stop_server`` the child is
+    dead and the kernel has closed the write-end of the pipe, so a
+    bounded read returns EOF promptly. We still wrap it in a thread with
+    a hard cap so a misbehaving child (e.g. forked worker holding the
+    fd) cannot pin the test forever.
+    """
+    if proc.poll() is None:
+        raise RuntimeError(
+            "drain_stderr requires the process to have exited "
+            "(call stop_server first)"
+        )
+    if proc.stderr is None:
+        return ""
+    import threading
+
+    holder: list[str] = []
+
+    def _drain() -> None:
+        try:
+            data = proc.stderr.read()
+            holder.append(data.decode(errors="replace"))
+        except Exception:
+            holder.append("")
+
+    th = threading.Thread(target=_drain, daemon=True)
+    th.start()
+    th.join(3.0)
+    if th.is_alive():
+        return "[stderr read timed out]"
+    return holder[0] if holder else ""
 
 
 def get_status(url: str, headers: dict[str, str] | None = None) -> int | None:
@@ -529,7 +604,12 @@ class TestWarningsAndNotes:
     def test_unauthenticated_remote_warning_from_subprocess(self, tmp_path):
         port = free_port()
         proc = spawn_server(
-            tmp_path, "streamable-http", port, host="0.0.0.0", capture_stderr=True
+            tmp_path,
+            "streamable-http",
+            port,
+            host="0.0.0.0",
+            capture_stderr=True,
+            extra_env={ENV_ALLOW_UNAUTHENTICATED: "1"},
         )
         try:
             wait_healthy(proc, port)
@@ -544,3 +624,365 @@ class TestWarningsAndNotes:
         err = capsys.readouterr().err
         assert "WORKFORGE_AUTH_TOKEN" in err
         assert "ignored" in err
+
+
+# -------------------------------------- config validation (rider 2/3/4)
+
+
+class TestConfigValidation:
+    """Invalid host / token strings are caught at resolve time, not at bind."""
+
+    def test_valid_hosts_pass(self):
+        for good in (
+            "127.0.0.1",
+            "localhost",
+            "0.0.0.0",
+            "[::1]",
+            "192.168.1.10",
+            "host.example.com",
+            "host-with-dash",
+        ):
+            config = resolve_config(host=good)
+            assert config.host == good, good
+
+    def test_invalid_host_empty_clean_error(self, monkeypatch, capsys):
+        monkeypatch.setattr(sys, "argv", ["workforge", "--host", ""])
+        with pytest.raises(SystemExit) as excinfo:
+            cli_main()
+        assert excinfo.value.code == 2
+        err = capsys.readouterr().err
+        assert "WORKFORGE_HOST" in err
+        assert "Traceback" not in err
+
+    def test_invalid_host_whitespace_clean_error(self, monkeypatch, capsys):
+        monkeypatch.setattr(sys, "argv", ["workforge", "--host", "not a host"])
+        with pytest.raises(SystemExit) as excinfo:
+            cli_main()
+        assert excinfo.value.code == 2
+        err = capsys.readouterr().err
+        assert "WORKFORGE_HOST" in err
+        assert "Traceback" not in err
+
+    def test_invalid_env_host_clean_error(self, monkeypatch, capsys):
+        monkeypatch.setattr(sys, "argv", ["workforge"])
+        monkeypatch.setenv("WORKFORGE_HOST", "bad\tvalue")
+        with pytest.raises(SystemExit) as excinfo:
+            cli_main()
+        assert excinfo.value.code == 2
+        assert "WORKFORGE_HOST" in capsys.readouterr().err
+
+    def test_invalid_utf8_token_clean_error(self, monkeypatch, capsys):
+        monkeypatch.setattr(sys, "argv", ["workforge"])
+        # undecodable surrogate: valid str, blows up at .encode("utf-8")
+        monkeypatch.setenv("WORKFORGE_AUTH_TOKEN", "\udcff")
+        with pytest.raises(SystemExit) as excinfo:
+            cli_main()
+        assert excinfo.value.code == 2
+        err = capsys.readouterr().err
+        assert "WORKFORGE_AUTH_TOKEN" in err
+        assert "UTF-8" in err
+        assert "Traceback" not in err
+
+    def test_non_ascii_but_valid_utf8_token_accepted(self, monkeypatch):
+        monkeypatch.setattr(sys, "argv", ["workforge"])
+        monkeypatch.setenv("WORKFORGE_AUTH_TOKEN", "héllo-bear-🦀")  # valid UTF-8
+        # resolve_config succeeds; serve() is never called from this test
+        config = resolve_config()
+        assert config.auth_token == "héllo-bear-🦀"
+
+    def test_config_repr_omits_token(self):
+        """repr=False keeps the bearer out of tracebacks / logs."""
+        config = TransportConfig(transport="streamable-http", auth_token="supersecret")
+        rendered = repr(config)
+        assert "supersecret" not in rendered
+        assert "auth_token" not in rendered  # dataclass repr hides repr=False fields
+        # But the field is still accessible programmatically.
+        assert config.auth_token == "supersecret"
+
+
+# ------------------------------------- health body (rider 1)
+
+
+class TestHealthBody:
+    """/health returns exactly {"status": "ok"} — no version fingerprint."""
+
+    def test_health_body_streamable_http(self, http_server):
+        with urllib.request.urlopen(
+            f"{http_server.base_url}/health", timeout=5
+        ) as response:
+            body = response.read().decode()
+        assert json.loads(body) == {"status": "ok"}
+
+    def test_health_body_sse(self, sse_server):
+        with urllib.request.urlopen(
+            f"{sse_server.base_url}/health", timeout=5
+        ) as response:
+            body = response.read().decode()
+        assert json.loads(body) == {"status": "ok"}
+
+
+# ------------------------------------- DNS-rebinding regression (blocker 1)
+
+
+def _get_with_host(url: str, host_header: str) -> int | None:
+    """HTTP GET with an explicit Host header (overrides urllib's default).
+
+    Returns the status code, or None on connection error.
+    """
+    request = urllib.request.Request(url, headers={"Host": host_header})
+    try:
+        with urllib.request.urlopen(request, timeout=5) as response:
+            return response.status
+    except urllib.error.HTTPError as exc:
+        return exc.code
+
+
+class TestDnsRebindingHttp:
+    """Loopback-bound streamable-http rejects requests with a foreign Host.
+
+    Without this guard, a browser-side page can fetch
+    ``http://localhost:8000/mcp`` and DNS-rebind ``127.0.0.1` to a hostile
+    origin — so loopback-only is NOT enough; Host validation closes the gap.
+    """
+
+    def test_correct_host_passes_http(self, http_server):
+        # No explicit Host override → urllib sends Host: 127.0.0.1:port → allowed
+        assert get_status(f"{http_server.base_url}/health") == 200
+
+    def test_spoofed_host_rejected_http(self, http_server):
+        # spoofed Host header — a browser-side DNS-rebind would send this
+        assert (
+            _get_with_host(
+                f"{http_server.base_url}/health", "evil.example"
+            )
+            == 421
+        )
+
+
+class TestDnsRebindingSse:
+    """Same regression as TestDnsRebindingHttp but for SSE — wires differently."""
+
+    def test_correct_host_passes_sse(self, sse_server):
+        assert get_status(f"{sse_server.base_url}/health") == 200
+
+    def test_spoofed_host_rejected_sse(self, sse_server):
+        assert (
+            _get_with_host(
+                f"{sse_server.base_url}/health", "evil.example"
+            )
+            == 421
+        )
+
+
+# ------------------------------------- auth edge cases (rider 5)
+
+
+class TestAuthEdges:
+    """Auth middleware must reject every malformed Authorization header."""
+
+    def test_basic_auth_rejected_http(self, auth_http_server):
+        assert (
+            http_code(
+                "POST",
+                auth_http_server.mcp_url,
+                headers={"Authorization": "Basic x"},
+            )
+            == 401
+        )
+
+    def test_empty_bearer_rejected_http(self, auth_http_server):
+        assert (
+            http_code(
+                "POST",
+                auth_http_server.mcp_url,
+                headers={"Authorization": "Bearer "},
+            )
+            == 401
+        )
+
+    def test_lowercase_bearer_accepted_with_valid_token_http(
+        self, auth_http_server
+    ):
+        """RFC 7235 says auth scheme is case-insensitive; fastmcp 4.0.8
+        accepts ``bearer`` (the upstream ``BearerAuthBackend`` lower-cases
+        the header before the startswith check). Documented in README.
+        """
+        # POST with a lowercase scheme; fastmcp's auth middleware
+        # normalizes the scheme, so anything other than 401 proves the
+        # lowercase form was accepted.
+        code = http_code(
+            "POST",
+            auth_http_server.mcp_url,
+            headers={
+                "Authorization": f"bearer {AUTH_TOKEN}",
+                "Accept": "application/json, text/event-stream",
+                "Content-Type": "application/json",
+            },
+        )
+        assert code is not None, "no response (connection error)"
+        assert code != 401, (
+            f"lowercase bearer was rejected: {code} "
+            f"(RFC 7235: scheme is case-insensitive)"
+        )
+
+    def test_malformed_garbage_header_rejected_http(self, auth_http_server):
+        assert (
+            http_code(
+                "POST",
+                auth_http_server.mcp_url,
+                headers={"Authorization": "this is not even close"},
+            )
+            == 401
+        )
+
+    def test_basic_auth_rejected_sse(self, auth_sse_server):
+        assert (
+            get_status(
+                auth_sse_server.sse_url,
+                headers={"Authorization": "Basic x"},
+            )
+            == 401
+        )
+
+    def test_empty_bearer_rejected_sse(self, auth_sse_server):
+        assert (
+            get_status(
+                auth_sse_server.sse_url,
+                headers={"Authorization": "Bearer "},
+            )
+            == 401
+        )
+
+    def test_malformed_garbage_header_rejected_sse(self, auth_sse_server):
+        assert (
+            get_status(
+                auth_sse_server.sse_url,
+                headers={"Authorization": "garbage"},
+            )
+            == 401
+        )
+
+
+# ------------------------------------- remote-auth gate (blocker 2)
+
+
+class TestRemoteAuthGate:
+    """Non-loopback HTTP/SSE bind with no token REFUSES to start."""
+
+    def test_gate_unit_non_loopback_no_token_raises(self, monkeypatch):
+        monkeypatch.delenv(ENV_ALLOW_UNAUTHENTICATED, raising=False)
+        config = TransportConfig(
+            transport="streamable-http", host="0.0.0.0", port=8123
+        )
+        with pytest.raises(SystemExit) as excinfo:
+            enforce_remote_auth_gate(config)
+        assert excinfo.value.code == 2
+
+    def test_gate_unit_loopback_no_token_passes(self, monkeypatch):
+        monkeypatch.delenv(ENV_ALLOW_UNAUTHENTICATED, raising=False)
+        # Loopback is fine without a token; DNS-rebinding middleware covers it.
+        enforce_remote_auth_gate(
+            TransportConfig(transport="streamable-http", host="127.0.0.1")
+        )
+        enforce_remote_auth_gate(
+            TransportConfig(transport="streamable-http", host="localhost")
+        )
+
+    def test_gate_unit_token_passes(self, monkeypatch):
+        monkeypatch.delenv(ENV_ALLOW_UNAUTHENTICATED, raising=False)
+        enforce_remote_auth_gate(
+            TransportConfig(
+                transport="streamable-http", host="0.0.0.0", auth_token="any"
+            )
+        )
+
+    def test_gate_unit_allow_unauthenticated_passes(self, monkeypatch):
+        monkeypatch.setenv(ENV_ALLOW_UNAUTHENTICATED, "1")
+        enforce_remote_auth_gate(
+            TransportConfig(transport="streamable-http", host="0.0.0.0")
+        )
+
+    def test_gate_unit_stdio_never_gated(self, monkeypatch):
+        monkeypatch.delenv(ENV_ALLOW_UNAUTHENTICATED, raising=False)
+        # stdio has no HTTP surface — gate is a no-op even with no token.
+        enforce_remote_auth_gate(TransportConfig(transport="stdio"))
+
+    def test_gate_unit_allow_unauthenticated_other_value_rejected(
+        self, monkeypatch
+    ):
+        monkeypatch.setenv(ENV_ALLOW_UNAUTHENTICATED, "true")
+        with pytest.raises(SystemExit):
+            enforce_remote_auth_gate(
+                TransportConfig(transport="streamable-http", host="0.0.0.0")
+            )
+
+    def test_gate_subprocess_no_token_refuses(self, tmp_path):
+        port = free_port()
+        proc = spawn_server(
+            tmp_path,
+            "streamable-http",
+            port,
+            host="0.0.0.0",
+            capture_stderr=True,
+        )
+        # Server should refuse and exit; give it a moment, then verify.
+        try:
+            rc = proc.wait(timeout=10)
+        finally:
+            if proc.returncode is None:
+                stop_server(proc)
+        assert rc != 0, "process should have refused to start"
+        stderr = proc.stderr.read().decode(errors="replace")
+        assert "refusing to start" in stderr
+        assert "WORKFORGE_AUTH_TOKEN" in stderr
+        assert ENV_ALLOW_UNAUTHENTICATED in stderr
+
+    def test_gate_subprocess_allow_unauthenticated_starts_with_warning(
+        self, tmp_path
+    ):
+        port = free_port()
+        proc = spawn_server(
+            tmp_path,
+            "streamable-http",
+            port,
+            host="0.0.0.0",
+            capture_stderr=True,
+            extra_env={ENV_ALLOW_UNAUTHENTICATED: "1"},
+        )
+        try:
+            wait_healthy(proc, port)
+        finally:
+            stop_server(proc)
+        stderr = drain_stderr(proc)
+        assert "WARNING" in stderr  # the loud warning still fires
+        assert "NON-localhost" in stderr
+
+    def test_gate_subprocess_token_starts_clean(self, tmp_path):
+        port = free_port()
+        proc = spawn_server(
+            tmp_path,
+            "streamable-http",
+            port,
+            host="0.0.0.0",
+            capture_stderr=True,
+            extra_env={"WORKFORGE_AUTH_TOKEN": "anytoken"},
+        )
+        try:
+            wait_healthy(proc, port)
+        finally:
+            stop_server(proc)
+        stderr = drain_stderr(proc)
+        # No refusal message, no WARNING.
+        assert "refusing to start" not in stderr
+        assert "NON-localhost" not in stderr
+
+    def test_gate_subprocess_loopback_no_token_allowed(self, tmp_path):
+        port = free_port()
+        proc = spawn_server(
+            tmp_path, "streamable-http", port, host="127.0.0.1",
+            capture_stderr=True,
+        )
+        try:
+            wait_healthy(proc, port)
+        finally:
+            stop_server(proc)
