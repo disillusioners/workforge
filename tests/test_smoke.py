@@ -26,6 +26,9 @@ EXPECTED_TOOLS = {
     "job_status",
     "get_log",
     "get_output",
+    # phase 2: optional Postgres run history (require WORKFORGE_DATABASE_URL).
+    "list_history",
+    "history_detail",
 }
 
 HELLO_SCRIPT = "print('hello from workforge')\n"

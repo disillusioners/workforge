@@ -1,9 +1,9 @@
-"""WorkForge MCP server: the 7 agent-facing tools.
+"""WorkForge MCP server: the 9 agent-facing tools.
 
 Tools
 -----
 save_script, list_scripts, run_script, run_script_async,
-job_status, get_log, get_output
+job_status, get_log, get_output, list_history, history_detail
 
 Served over stdio by default (``workforge.cli:main`` -> ``mcp.run()``).
 """
@@ -13,6 +13,7 @@ from __future__ import annotations
 from typing import Any
 
 from fastmcp import FastMCP
+from fastmcp.exceptions import ToolError
 
 from . import engine, storage
 
@@ -123,3 +124,56 @@ def get_output(job_id: str) -> dict[str, Any]:
     captured fields are empty/null.
     """
     return engine.get_output(job_id)
+
+
+@mcp.tool()
+def list_history(
+    limit: int = 50, script_name: str | None = None, status: str | None = None
+) -> list[dict[str, Any]]:
+    """List past runs from persistent history (optional Postgres backend).
+
+    Requires WORKFORGE_DATABASE_URL to be set (see .env.example); without it
+    this raises a structured error instead of silently returning nothing.
+
+    Args:
+        limit: Max rows to return, 1..200 (default 50). Values outside the
+            range are rejected as errors.
+        script_name: Only runs of this saved script.
+        status: One of queued | running | succeeded | failed.
+
+    Returns newest-first rows:
+    [{job_id, script_name, status, exit_code, started_at, duration_ms}].
+    Rows appear once a job starts; queued-but-never-started jobs are absent.
+    """
+    from . import history  # lazy: keeps PG (and psycopg) off the default path
+
+    try:
+        return history.list_runs(limit=limit, script_name=script_name, status=status)
+    except ValueError as exc:
+        # Re-raised as ToolError so the message reaches the client VERBATIM
+        # (not-configured, invalid limit/status filters, PG down, ...).
+        raise ToolError(str(exc)) from None
+
+
+@mcp.tool()
+def history_detail(job_id: str) -> dict[str, Any]:
+    """Get one past run's full record from persistent history.
+
+    Args:
+        job_id: Job identifier (32-char hex, as returned by run_script*).
+
+    Requires WORKFORGE_DATABASE_URL to be set (see .env.example). Unknown or
+    malformed job_id raises a structured error.
+
+    Returns {job_id, input: {script_name, args, timeout_seconds},
+    output: {status, exit_code, stdout, stderr, duration_ms, started_at,
+    finished_at}} — the recorded inputs and final result of that run.
+    """
+    from . import history
+
+    try:
+        return history.get_run_detail(job_id)
+    except ValueError as exc:
+        # Same as list_history: verbatim structured messages (unknown or
+        # malformed job_id, not configured, PG down, ...).
+        raise ToolError(str(exc)) from None

@@ -101,6 +101,7 @@ def _shutdown_pool() -> None:
             meta["finished_at"] = storage.now_iso()
             meta["error"] = "interrupted: shutdown before start"
             _safe_write_job_meta(meta)
+            _safe_record_history(meta)
 
 
 atexit.register(_shutdown_pool)
@@ -182,6 +183,7 @@ def submit(name: str, args: list[Any], timeout_seconds: int) -> dict[str, Any]:
         meta["finished_at"] = storage.now_iso()
         meta["error"] = f"submission failed: {exc!r}"
         _safe_write_job_meta(meta)
+        _safe_record_history(meta)
         raise
     return {"job_id": meta["job_id"], "status": meta["status"]}
 
@@ -248,6 +250,7 @@ def _execute(meta: dict[str, Any]) -> None:
         meta["status"] = "running"
         meta["started_at"] = storage.now_iso()
         storage.write_job_meta(meta)
+        _safe_record_history(meta)  # INSERT (status=running) when history is on
 
         cmd = [sys.executable, meta["script_path"], *meta["args"]]
         proc = subprocess.Popen(
@@ -318,6 +321,7 @@ def _execute(meta: dict[str, Any]) -> None:
                 meta["status"] = "failed"
                 meta["error"] = f"exited with code {proc.returncode}"
         _safe_write_job_meta(meta)
+        _safe_record_history(meta)  # UPDATE to the final status
     except Exception as exc:
         # Spawn/pump failure (e.g. OSError from Popen): finalize the record so
         # an async job never ends up "running" forever with no process.
@@ -333,6 +337,7 @@ def _execute(meta: dict[str, Any]) -> None:
             except Exception:
                 pass
         _safe_write_job_meta(meta)
+        _safe_record_history(meta)
     finally:
         with _in_flight_lock:
             _in_flight.pop(meta["job_id"], None)
@@ -381,6 +386,28 @@ def _terminate(proc: subprocess.Popen) -> None:
         proc.wait(timeout=5)
     except subprocess.TimeoutExpired:
         pass
+
+
+def _safe_record_history(meta: dict[str, Any]) -> None:
+    """Best-effort PG history write (phase 2). NEVER fails the job.
+
+    HARD RULES (feature A):
+    - No PG contact at all while WORKFORGE_DATABASE_URL is unset — checked
+      here first, so a history-less install does zero extra work and job
+      metas stay unpolluted.
+    - Any failure (connection, timeout, bad URL, ...) is swallowed and
+      recorded as ``history_write_error`` in the on-disk job meta, then the
+      meta is re-persisted so the error survives restarts.
+    """
+    if not os.environ.get("WORKFORGE_DATABASE_URL", "").strip():
+        return
+    try:
+        from . import history  # lazy: psycopg never loads unless used
+
+        history.record_job(meta)
+    except Exception as exc:
+        meta["history_write_error"] = repr(exc)[:500]
+        _safe_write_job_meta(meta)
 
 
 def _safe_write_job_meta(meta: dict[str, Any]) -> None:

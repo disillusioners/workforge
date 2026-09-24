@@ -7,6 +7,7 @@ WorkForge turns "can you run this snippet for me?" into a first-class MCP toolse
 - **MCP-native** — built on [FastMCP](https://github.com/jlowin/fastmcp), speaks stdio MCP: works with Claude Desktop, Cursor, and any MCP client.
 - **Sync *and* async execution** — block until done, or fire-and-forget with live log streaming.
 - **Durable by default** — scripts and job records live under one home directory (`WORKFORGE_HOME`, default `~/.workforge`).
+- **Persistent run history (optional)** — set `WORKFORGE_DATABASE_URL` and every run is recorded in Postgres, queryable via the `list_history` / `history_detail` tools.
 - **Tiny** — one dependency, ~a few hundred lines of readable Python.
 
 > ## ⚠️ Demo phase — no sandbox
@@ -82,6 +83,8 @@ Replace `/absolute/path/to/workforge` with the real cloned path. To give the ser
 | `job_status` | `(job_id)` | `{job_id, script, args, status, exit_code, submitted_at, started_at, finished_at, duration_ms, error}` | `status` ∈ `queued \| running \| succeeded \| failed`. Captured stdout/stderr omitted (use `get_output`); absolute `script_path` intentionally excluded. |
 | `get_log` | `(job_id, tail=null)` | combined stdout+stderr (text) | **Works mid-run** — output streams to disk as the script executes. `tail=N` = last N lines; `tail=0` returns the empty string (not the full log). |
 | `get_output` | `(job_id)` | `{job_id, script, args, status, exit_code, submitted_at, started_at, finished_at, duration_ms, stdout, stderr, error}` | Final structured result; absolute `script_path` intentionally excluded. |
+| `list_history` | `(limit=50, script_name=null, status=null)` | `[{job_id, script_name, status, exit_code, started_at, duration_ms}]` | **Requires Postgres** (see [Run history](#run-history-optional-postgres)). Newest-first rows of past runs; `limit` is 1–200 (anything else is rejected); `status` ∈ `queued \| running \| succeeded \| failed`. Raises a structured error when `WORKFORGE_DATABASE_URL` is unset. |
+| `history_detail` | `(job_id)` | `{job_id, input: {script_name, args, timeout_seconds}, output: {status, exit_code, stdout, stderr, duration_ms, started_at, finished_at}}` | **Requires Postgres.** Full record of one past run; unknown/malformed `job_id` raises a structured error. |
 
 Script names are slugs (lowercase letters, digits, `-`, `_`) — no paths, no dots. Scripts run with `sys.executable <script> <args...>` and `cwd` set to the job directory, so a script can write scratch files next to its own `job.log` without cluttering anything else.
 
@@ -97,6 +100,30 @@ $WORKFORGE_HOME (default ~/.workforge)
         ├── meta.json      # job record: status, timestamps, exit code, captured output
         └── job.log        # combined stdout+stderr, streamed live during execution
 ```
+
+## Run history (optional Postgres)
+
+Phase 2 feature: with a Postgres URL configured, WorkForge records every job run in a `job_runs` table (inserted as `running` on start, updated to the final status at the end) and exposes two extra tools, `list_history` and `history_detail` (see [Tools](#tools)).
+
+### Setup
+
+```bash
+# 1. Point WorkForge at Postgres (no password needed for a default local
+#    install using unix-socket peer auth):
+export WORKFORGE_DATABASE_URL=postgresql:///workforge   # see .env.example
+
+# 2. Create the database + schema (guarded: only 'workforge' or
+#    'workforge_test' can ever be created):
+uv run workforge db-init        # or: uv run workforge-db-init
+```
+
+The schema (`job_runs` plus `created_at`/`script_name` indexes) is also ensured automatically on first use, so `db-init` is only needed for the database itself.
+
+### Deployment notes
+
+- **The MCP server reads `WORKFORGE_DATABASE_URL` from its environment at launch.** In an MCP client config, pass it in the `env` block, e.g. Claude Desktop: `"env": { "WORKFORGE_DATABASE_URL": "postgresql:///workforge" }` (same place as `WORKFORGE_HOME`).
+- **History is optional and fail-safe.** Unset, everything works exactly as before (the history tools raise a structured "not configured" error). With it set, a Postgres outage never fails a running job — the failure is recorded as `history_write_error` in the job's `meta.json` and the job completes normally. All history operations use short connect/query timeouts (~5s), so a dead database can never hang a tool or a job.
+- Tests target the `workforge_test` database only (`tests/test_history.py`) and skip automatically when Postgres is unreachable.
 
 ## Architecture (demo phase)
 
@@ -114,6 +141,7 @@ Async jobs share the sync execution path: a small thread pool starts each job as
 
 ## Roadmap
 
+- **Phase 2 — run history:** ✅ shipped — persistent run history in Postgres (`list_history` / `history_detail`, guarded `db-init`, fail-safe engine writes).
 - **Phase 2 — hardening:** sandboxed execution (containers / restricted privileges), authentication, resource limits (CPU/memory/disk), output truncation policies.
 - **Phase 2 — distribution:** remote workers (run jobs on another machine), multi-agent job queues, job cancellation.
 - **Phase 3 — ergonomics:** script versioning, cron/scheduled runs, a small web UI for job history.
